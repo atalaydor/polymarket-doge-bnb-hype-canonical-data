@@ -17,6 +17,7 @@ from canonical_data.models import (
     Asset,
     BookEvent,
     Exclusion,
+    ExclusionReason,
     Market,
     Provenance,
     QualityTier,
@@ -160,8 +161,18 @@ class Pipeline:
             except PipelineError:
                 has_pmxt = False
                 if kacho:
-                    states = ingest_kacho_ticks(market, kacho)
-                    native_samples, gaps = resample_200ms(market, states)
+                    try:
+                        states = ingest_kacho_ticks(market, kacho)
+                        native_samples, gaps = resample_200ms(market, states)
+                    except PipelineError as fallback_error:
+                        exclusions.append(
+                            Exclusion(
+                                market.market_id,
+                                ExclusionReason.EVENT_CONFLICT,
+                                f"invalid Kacho market evidence: {fallback_error}",
+                            )
+                        )
+                        continue
                 else:
                     states = []
                     native_samples, gaps = [], [(market.market_start_ns, market.market_end_ns)]

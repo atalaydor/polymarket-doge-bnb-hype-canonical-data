@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -162,6 +163,45 @@ class StateTests(unittest.TestCase):
 
 
 class PipelineTests(unittest.TestCase):
+    def test_invalid_kacho_market_is_evidence_backed_exclusion_not_partition_abort(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            good = market()
+            bad = replace(
+                good,
+                market_id="bad-market",
+                condition_id="0x" + "b" * 64,
+                token_up="3",
+                token_down="4",
+            )
+            base = {
+                "t": good.market_start_ns // 1_000_000_000,
+                "bu": "0.4",
+                "au": "0.6",
+                "su": "1",
+                "sau": "1",
+                "bd": "0.4",
+                "ad": "0.6",
+                "sd": "1",
+                "sad": "1",
+            }
+            rows = (
+                {**base, "condition_id": good.condition_id},
+                {**base, "condition_id": bad.condition_id, "bu": "0.7"},
+            )
+            built = Pipeline(root / "out", StateStore(root / "state"), COMMIT).build(
+                PartitionInputs(
+                    Asset.DOGE,
+                    "2026-04-13",
+                    (good, bad),
+                    kacho_rows=rows,
+                    provenance=(provenance("kacho_5m"),),
+                ),
+                good.market_end_ns,
+            )
+            exclusions = pq.ParquetFile(built.directory / "exclusions.parquet").read().to_pylist()
+            self.assertEqual(exclusions[0]["reason_code"], "EVENT_CONFLICT")
+
     def test_pmxt_failure_can_only_degrade_to_explicit_kacho_tier_b(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
