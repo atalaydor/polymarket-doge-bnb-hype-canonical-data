@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import resource
 import shutil
 import subprocess
 import time
@@ -21,12 +22,13 @@ from canonical_data.audit import canonical_json_bytes
 from canonical_data.binance import ingest_binance_zip
 from canonical_data.discovery import GammaClient
 from canonical_data.httpclient import USER_AGENT
-from canonical_data.inventory import SourceObject
+from canonical_data.inventory import SourceObject, pmxt_hourly_objects
 from canonical_data.manifest import hash_file
 from canonical_data.models import Asset, Provenance
 from canonical_data.pipeline import PartitionInputs, Pipeline, PipelineLimits
 from canonical_data.release import GitHubReleaseBackend, Publisher
 from canonical_data.sources import ProductionSourceLoader
+from canonical_data.spool import EventSpool
 from canonical_data.state import StateStore
 
 RETRY_DELAYS = (2, 8, 32)
@@ -104,6 +106,29 @@ def _market_starts(metadata: Path, day: date) -> list[int]:
         filters=[("market_start", ">=", start), ("market_start", "<", end)],
     )
     return sorted(int(value.timestamp()) for value in table["market_start"].to_pylist())
+
+
+def _expected_market_starts(day: date) -> list[int]:
+    midnight = int(datetime(day.year, day.month, day.day, tzinfo=UTC).timestamp())
+    return [midnight + offset for offset in range(0, 86_400, 300)]
+
+
+def _retry_pmxt(
+    loader: ProductionSourceLoader, url: str, markets: tuple[Any, ...]
+) -> Any:
+    last: Exception | None = None
+    for attempt, delay in enumerate((0, *RETRY_DELAYS)):
+        if delay:
+            time.sleep(delay)
+        try:
+            return loader.load_pmxt([url], markets)
+        except (urllib.error.URLError, TimeoutError) as exc:
+            last = exc
+        if attempt == len(RETRY_DELAYS):
+            break
+    if last is not None:
+        raise last
+    raise AssertionError("unreachable PMXT retry state")
 
 
 def run_tier_b(
@@ -199,6 +224,111 @@ def run_tier_b(
     return result
 
 
+def run_partition(
+    asset: Asset,
+    day: date,
+    kacho_root: Path,
+    work_root: Path,
+    ledger_path: Path,
+) -> dict[str, Any]:
+    if day <= date(2026, 4, 12):
+        return run_tier_b(asset, day, kacho_root, work_root, ledger_path)
+    partition_id = f"{asset.value}/5m/{day.isoformat()}"
+    ledger = json.loads(ledger_path.read_bytes()) if ledger_path.exists() else {"partitions": {}}
+    if partition_id in ledger["partitions"]:
+        return cast(dict[str, Any], ledger["partitions"][partition_id])
+    began = time.perf_counter()
+    cpu_began = time.process_time()
+    metadata_name, ticks_name = KACHO_FILES[asset]
+    starts = _market_starts(kacho_root / metadata_name, day)
+    if not starts:
+        starts = _expected_market_starts(day)
+    work = work_root / f"{asset.value}-{day.isoformat()}"
+    loader = ProductionSourceLoader(GammaClient(), time.time_ns(), work / "official")
+    discovered = loader.discover(asset, starts)
+    spool_path = work / "pmxt-events.sqlite"
+    pmxt_provenance: list[Provenance] = []
+    pmxt_events = 0
+    day_start_ns = int(datetime(day.year, day.month, day.day, tzinfo=UTC).timestamp() * 1e9)
+    inventory_start_ns = max(day_start_ns - 3_600_000_000_000, 1_776_106_800_000_000_000)
+    day_end_ns = day_start_ns + 86_400_000_000_000
+    with EventSpool(spool_path) as spool:
+        for source in pmxt_hourly_objects(inventory_start_ns, day_end_ns):
+            loaded = _retry_pmxt(loader, source.url, discovered.markets)
+            pmxt_events += spool.append(loaded.events)
+            pmxt_provenance.extend(loaded.provenance)
+    kacho_rows: list[dict[str, object]] = []
+    kacho_provenance: tuple[Provenance, ...] = ()
+    if starts and day <= date(2026, 5, 18):
+        rows, provenance = loader.load_kacho(kacho_root / ticks_name, discovered.markets)
+        kacho_rows = rows
+        kacho_provenance = (provenance,)
+    symbol, binance_root, precision = _instrument(asset)
+    filename = f"{symbol}-1m-{day.isoformat()}.zip"
+    url = f"{binance_root}/klines/{symbol}/1m/{filename}"
+    checksum = _fetch_text(url + ".CHECKSUM").split()[0]
+    acquired = BoundedAcquirer(work / "raw", 10_000_000, 8_000_000_000).acquire(
+        SourceObject("binance_public", url, checksum)
+    )
+    observations = ingest_binance_zip(acquired.path, checksum, asset, "klines", url)
+    binance_bytes, binance_digest = hash_file(acquired.path)
+    binance_provenance = Provenance(
+        "binance_public",
+        url,
+        time.time_ns(),
+        binance_bytes,
+        binance_digest,
+        "MIT_archive_repository_claim",
+        precision,
+        upstream_checksum=checksum,
+        transformations=("checksum_verify",),
+    )
+    inputs = PartitionInputs(
+        asset,
+        day.isoformat(),
+        discovered.markets,
+        kacho_rows=tuple(kacho_rows),
+        underlying=tuple(observations),
+        provenance=(
+            *discovered.provenance,
+            *pmxt_provenance,
+            *kacho_provenance,
+            binance_provenance,
+        ),
+        temporary_raw_paths=(acquired.path, spool_path),
+        event_spool_path=spool_path,
+    )
+    pipeline = Pipeline(work / "output", StateStore(work / "state"), _tool_commit())
+    built = pipeline.build(inputs, day_end_ns)
+    release_tag = f"dataset-v1-{day:%Y-%m}"
+    assets = pipeline.publish(
+        built,
+        Publisher(GitHubReleaseBackend("atalaydor/polymarket-doge-bnb-hype-canonical-data")),
+        release_tag,
+        inputs.temporary_raw_paths,
+    )
+    result = {
+        "partition_id": partition_id,
+        "quality": built.tier.value,
+        "markets": len(discovered.markets),
+        "pmxt_events": pmxt_events,
+        "kacho_rows": len(kacho_rows),
+        "underlying_rows": len(observations),
+        "canonical_bytes": sum(path.stat().st_size for path in built.directory.iterdir()),
+        "manifest_sha256": built.manifest_digest,
+        "release_tag": release_tag,
+        "remote_assets": len(assets),
+        "source_bytes": binance_bytes + sum(item.byte_length for item in pmxt_provenance),
+        "wall_seconds": time.perf_counter() - began,
+        "cpu_seconds": time.process_time() - cpu_began,
+        "peak_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+    }
+    ledger["partitions"][partition_id] = result
+    _atomic_json(ledger_path, ledger)
+    shutil.rmtree(work)
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--kacho-root", type=Path, required=True)
@@ -212,7 +342,7 @@ def main() -> None:
         for asset in Asset:
             print(
                 json.dumps(
-                    run_tier_b(asset, current, args.kacho_root, args.work_root, args.ledger),
+                    run_partition(asset, current, args.kacho_root, args.work_root, args.ledger),
                     sort_keys=True,
                 ),
                 flush=True,
