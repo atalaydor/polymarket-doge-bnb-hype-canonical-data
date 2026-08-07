@@ -233,14 +233,22 @@ def prepare_shared_day(
             if source.url in state["completed_urls"]:
                 continue
             acquired = _acquire_with_retry(source, shared / "raw")
-            by_asset: dict[str, Any] = {}
-            for asset in Asset:
-                loader, discovery = discoveries[asset]
-                loaded = loader.load_downloaded_pmxt(
-                    acquired.path, source.url, discovery.markets, acquired.etag
-                )
-                spool.append(loaded.events)
-                by_asset[asset.value] = asdict(loaded.provenance[0])
+            combined_markets = tuple(
+                market
+                for asset in Asset
+                for market in discoveries[asset][1].markets
+            )
+            loaded = discoveries[Asset.DOGE][0].load_downloaded_pmxt(
+                acquired.path,
+                source.url,
+                combined_markets,
+                acquired.etag,
+                max_filtered_rows=500_000,
+            )
+            spool.append(loaded.events)
+            by_asset = {
+                asset.value: asdict(loaded.provenance[0]) for asset in Asset
+            }
             state["completed_urls"][source.url] = by_asset
             state["source_bytes"] = int(state["source_bytes"]) + acquired.byte_length
             _atomic_json(state_path, state)
