@@ -14,7 +14,12 @@
     "quality_tier":{"enum":["TIER_A","TIER_B"]},
     "files":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/file"}},
     "provenance":{"type":"array","minItems":1,"items":{"type":"object"}},
-    "exclusions":{"type":"array","items":{"type":"object","required":["market_id","reason_code"]}}
+    "exclusions":{"type":"array","items":{"type":"object","required":["market_id","reason_code"]}},
+    "inputs":{"type":"array","items":{"type":"object","required":["source_id","byte_length","sha256"]}},
+    "tool_commit":{"type":"string","pattern":"^[0-9a-f]{40}$"},
+    "parameters":{"type":"object"},
+    "statistics":{"type":"object"},
+    "release_cutoff_ns":{"type":"integer"}
   },
   "$defs":{"file":{"type":"object","additionalProperties":false,"required":["path","byte_length","sha256"],"properties":{"path":{"type":"string"},"byte_length":{"type":"integer","minimum":0},"sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}}}}
 }

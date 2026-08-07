@@ -1,8 +1,8 @@
 # DOGE / BNB / HYPE canonical historical data
 
-This public repository defines a zero-cost, resumable pipeline contract for Polymarket DOGE,
-BNB, and HYPE **5-minute Up/Down** markets. Chapter 1 freezes feasibility and architecture; it
-does not contain or build the historical dataset.
+This public repository implements the zero-cost, resumable production pipeline for Polymarket DOGE,
+BNB, and HYPE **5-minute Up/Down** markets. Chapter 1 froze feasibility and architecture; Chapter 2
+implements the complete pipeline without building the historical dataset.
 
 The target is a portable immutable public release that a Linux consumer can download and verify.
 It is a sanitized **interchange/import contract**, not a claim of compatibility with any private
@@ -18,7 +18,8 @@ factory. Windows is gateway-only; processing occurs in a 2-core GitHub Codespace
   and any market whose identity, rules, timestamps, or official result cannot be verified.
 
 See [source authority](docs/source-authority.md), [contract](docs/dataset-contract.md), and
-[architecture](docs/storage-and-execution-architecture.md). Run:
+[architecture](docs/storage-and-execution-architecture.md). Operational ownership is documented in
+[pipeline operations](docs/pipeline-operations.md). Run:
 
 ```bash
 python -m unittest discover -s tests -v

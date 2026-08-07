@@ -31,6 +31,7 @@ def load_json(path: Path) -> Any:
 def offline_audit(root: Path = ROOT) -> dict[str, Any]:
     sources = load_json(root / "config/sources.json")
     scope = load_json(root / "config/scope.json")
+    pipeline = load_json(root / "config/pipeline.json")
     schema = load_json(root / "schemas/partition-manifest.schema.json")
     ids = [source["id"] for source in sources["sources"]]
     errors: list[str] = []
@@ -42,6 +43,19 @@ def offline_audit(root: Path = ROOT) -> dict[str, Any]:
         errors.append("asset scope changed")
     if schema.get("$schema") != "https://json-schema.org/draft/2020-12/schema":
         errors.append("manifest schema draft changed")
+    if pipeline["execution"] != {
+        "workers": 1,
+        "sample_interval_ms": 200,
+        "partition": "asset/timeframe/utc_date",
+    }:
+        errors.append("pipeline execution boundary changed")
+    limits = pipeline["resource_limits"]
+    if limits["max_transformed_partition_bytes"] != 1_000_000_000:
+        errors.append("transformed partition cap changed")
+    if limits["minimum_free_disk_bytes"] < 8_000_000_000:
+        errors.append("disk headroom weakened")
+    if limits["minimum_available_memory_bytes"] < 2_000_000_000:
+        errors.append("memory headroom weakened")
     return {
         "errors": errors,
         "source_count": len(ids),
