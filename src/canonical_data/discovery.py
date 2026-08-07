@@ -13,6 +13,7 @@ from typing import Any, cast
 
 from canonical_data.audit import canonical_json_bytes
 from canonical_data.errors import IdentityError
+from canonical_data.httpclient import USER_AGENT
 from canonical_data.models import Asset, Market, Outcome, QualityTier
 
 SLUG = re.compile(r"^(doge|bnb|hype)-updown-5m-([0-9]{10})$")
@@ -27,7 +28,9 @@ FetchPayload = Callable[[str, int], bytes]
 
 
 def _bounded_fetch(url: str, max_bytes: int) -> bytes:
-    request = urllib.request.Request(url, headers={"Accept": "application/json"})
+    request = urllib.request.Request(
+        url, headers={"Accept": "application/json", "User-Agent": USER_AGENT}
+    )
     with urllib.request.urlopen(request, timeout=30) as response:
         length = response.headers.get("Content-Length")
         if length is not None and int(length) > max_bytes:

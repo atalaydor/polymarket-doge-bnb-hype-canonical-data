@@ -6,24 +6,60 @@ import tempfile
 import unittest
 import zipfile
 from dataclasses import replace
+from datetime import date
 from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-from helpers import CONDITION, START_NS, market
+from helpers import CONDITION, START_NS, gamma_payload, market
 
 from canonical_data.acquire import BoundedAcquirer, copy_bounded
 from canonical_data.binance import ingest_binance_zip
+from canonical_data.discovery import GammaClient
 from canonical_data.errors import ResourceLimitError, SourceError
 from canonical_data.inventory import SourceObject, binance_daily_objects, pmxt_hourly_objects
 from canonical_data.kacho import ingest_kacho_ticks, kacho_native_events, read_kacho_parquet
 from canonical_data.models import Asset, ExclusionReason, Outcome, QualityTier
+from canonical_data.planner import build_backfill_plan
 from canonical_data.quality import RELEASE_START, classify
 from canonical_data.rangeio import BoundedRangeReader
 from canonical_data.resample import resample_200ms
+from canonical_data.sources import ProductionSourceLoader
 
 
 class InventoryAndAcquisitionTests(unittest.TestCase):
+    def test_finite_backfill_plan_is_ordered_and_month_grouped(self) -> None:
+        plan = build_backfill_plan(date(2026, 4, 5), date(2026, 8, 7))
+        self.assertEqual(len(plan), 375)
+        self.assertEqual(plan[0]["partition_id"], "DOGE/5m/2026-04-05")
+        self.assertEqual(plan[-1]["partition_id"], "HYPE/5m/2026-08-07")
+        groups = {row["release_group"] for row in plan}
+        self.assertEqual(len(groups), 5)
+        self.assertLessEqual(
+            max(sum(row["release_group"] == group for row in plan) for group in groups), 93
+        )
+
+    def test_official_discovery_cache_pins_mutable_gamma_payload_for_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            calls: list[str] = []
+
+            def fetch(url: str, _limit: int) -> bytes:
+                calls.append(url)
+                return gamma_payload()
+
+            cache = Path(temp) / "official"
+            first = ProductionSourceLoader(GammaClient(fetch), 1, cache).discover(
+                Asset.DOGE, [START_NS // 1_000_000_000]
+            )
+            second = ProductionSourceLoader(
+                GammaClient(lambda _url, _limit: (_ for _ in ()).throw(AssertionError())),
+                2,
+                cache,
+            ).discover(Asset.DOGE, [START_NS // 1_000_000_000])
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(first.markets, second.markets)
+            self.assertEqual(first.provenance[0].sha256, second.provenance[0].sha256)
+
     def test_seekable_range_reader_ledgers_and_enforces_cap(self) -> None:
         payload = b"0123456789"
         reader = BoundedRangeReader(
@@ -75,11 +111,18 @@ class KachoTests(unittest.TestCase):
             table = pa.Table.from_pylist(
                 [
                     {"condition_id": CONDITION, "t": START_NS // 1_000_000_000},
+                    {"condition_id": CONDITION, "t": START_NS // 1_000_000_000 + 600},
                     {"condition_id": "other", "t": START_NS // 1_000_000_000},
                 ]
             )
             pq.write_table(table, path)
-            rows = read_kacho_parquet(path, {CONDITION}, max_rows=1)
+            rows = read_kacho_parquet(
+                path,
+                {CONDITION},
+                max_rows=1,
+                start_s=START_NS // 1_000_000_000,
+                end_s=START_NS // 1_000_000_000 + 300,
+            )
             self.assertEqual([row["condition_id"] for row in rows], [CONDITION])
 
     def test_tier_b_semantics_and_inferred_outcome_ignored(self) -> None:

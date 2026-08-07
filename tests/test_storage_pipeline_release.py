@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 
 import pyarrow.parquet as pq
 from helpers import market, pmxt_rows, provenance
@@ -26,6 +27,7 @@ from canonical_data.pipeline import PartitionInputs, Pipeline, PipelineLimits
 from canonical_data.pmxt import BookReconstructor, decode_rows
 from canonical_data.release import (
     DirectoryReleaseBackend,
+    GitHubReleaseBackend,
     Publisher,
     download_and_verify_release,
 )
@@ -78,6 +80,7 @@ class ParquetManifestTests(unittest.TestCase):
             notice_digest = build_notice(root / "NOTICE.json", config)
             self.assertEqual(len(index_digest), 64)
             self.assertEqual(len(notice_digest), 64)
+            self.assertNotIn(str(root).encode(), (root / "index.json").read_bytes())
             notice = json.loads((root / "NOTICE.json").read_bytes())
             self.assertIsNone(notice["combined_dataset_license"])
             self.assertEqual([item["source_id"] for item in notice["sources"]], ["pmxt_v2"])
@@ -196,7 +199,50 @@ class PipelineTests(unittest.TestCase):
             markets = pq.ParquetFile(built.directory / "markets.parquet").read().to_pylist()
             self.assertEqual(markets[0]["official_outcome"], "UP")
 
+    def test_reconstructable_pmxt_initial_gap_uses_matching_kacho_tier_b(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            delayed = []
+            for row in pmxt_rows(False):
+                delayed.append(
+                    {
+                        **row,
+                        "timestamp": row["timestamp"] + 1_000,
+                        "timestamp_received": row["timestamp_received"] + 1_000,
+                    }
+                )
+            kacho = (
+                {
+                    "condition_id": market().condition_id,
+                    "t": market().market_start_ns // 1_000_000_000,
+                    "bu": "0.4",
+                    "au": "0.6",
+                    "su": "1",
+                    "sau": "1",
+                    "bd": "0.4",
+                    "ad": "0.6",
+                    "sd": "1",
+                    "sad": "1",
+                },
+            )
+            built = Pipeline(root / "out", StateStore(root / "state"), COMMIT).build(
+                PartitionInputs(
+                    Asset.DOGE,
+                    "2026-04-13",
+                    (market(),),
+                    tuple(delayed),
+                    "fixture",
+                    kacho,
+                    provenance=(provenance("kacho_5m"),),
+                ),
+                market().market_end_ns,
+            )
+            self.assertEqual(built.tier, QualityTier.TIER_B)
+            samples = pq.ParquetFile(built.directory / "book-200ms.parquet").read()
+            self.assertEqual(set(samples["quality_tier"].to_pylist()), {"TIER_B"})
+
     def test_partition_resource_caps_fail_before_work(self) -> None:
+        self.assertEqual(PipelineLimits().max_pmxt_rows, 3_000_000)
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             limits = PipelineLimits(max_markets=0)
@@ -331,6 +377,42 @@ class FailingOnceBackend(DirectoryReleaseBackend):
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_github_draft_lookup_enumerates_drafts_instead_of_tag_endpoint(self) -> None:
+        class FakeGitHub(GitHubReleaseBackend):
+            def __init__(self) -> None:
+                self.api = "https://api.example.test/repos/owner/repository"
+                self.calls: list[tuple[str, str]] = []
+
+            def _request(
+                self,
+                method: str,
+                url: str,
+                payload: bytes | None = None,
+                content_type: str = "application/json",
+            ) -> Any:
+                del payload, content_type
+                self.calls.append((method, url))
+                return [{"id": 42, "tag_name": "pilot", "draft": True}]
+
+        backend = FakeGitHub()
+        self.assertEqual(backend.ensure_draft("pilot"), "42")
+        self.assertEqual(backend.calls[0][0], "GET")
+        self.assertIn("/releases?", backend.calls[0][1])
+
+    def test_same_logical_filename_in_different_partitions_is_not_a_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            first = root / "first"
+            second = root / "second"
+            first.mkdir()
+            second.mkdir()
+            (first / "manifest.json").write_bytes(b"one")
+            (second / "manifest.json").write_bytes(b"two")
+            publisher = Publisher(DirectoryReleaseBackend(root / "release"))
+            publisher.publish_partition("draft", "DOGE/5m/2026-04-13", first)
+            publisher.publish_partition("draft", "BNB/5m/2026-04-13", second)
+            self.assertEqual(len(DirectoryReleaseBackend(root / "release").list_assets("draft")), 2)
+
     def _fixture(self, root: Path) -> Path:
         fixture = root / "partition"
         fixture.mkdir()

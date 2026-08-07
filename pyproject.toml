@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "polymarket-doge-bnb-hype-canonical-data"
-version = "0.2.0"
+version = "0.3.0"
 description = "Public feasibility tooling and interchange contract for DOGE/BNB/HYPE Polymarket history"
 readme = "README.md"
 requires-python = ">=3.11"

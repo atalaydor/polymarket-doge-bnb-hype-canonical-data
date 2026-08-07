@@ -64,7 +64,7 @@ class BuiltPartition:
 @dataclass(frozen=True)
 class PipelineLimits:
     max_markets: int = 300
-    max_pmxt_rows: int = 1_000_000
+    max_pmxt_rows: int = 3_000_000
     max_kacho_rows: int = 100_000
     max_samples: int = 1_000_000
     max_underlying_rows: int = 1_000_000
@@ -135,31 +135,30 @@ class Pipeline:
             market_events = [
                 event for event in pmxt_events if event.condition_id == market.condition_id
             ]
+            kacho = [
+                row
+                for row in inputs.kacho_rows
+                if str(row.get("condition_id")) == market.condition_id
+            ]
             has_pmxt = bool(market_events)
-            has_kacho = bool(inputs.kacho_rows)
+            has_kacho = bool(kacho)
             states = []
             gaps: list[tuple[int, int]] = []
             try:
                 if has_pmxt:
                     states = BookReconstructor().reconstruct(market_events)
                     native_samples, gaps = resample_200ms(market, states)
+                    if gaps and has_kacho:
+                        states = ingest_kacho_ticks(market, kacho)
+                        native_samples, gaps = resample_200ms(market, states)
+                        has_pmxt = False
                 elif has_kacho:
-                    kacho = [
-                        row
-                        for row in inputs.kacho_rows
-                        if str(row.get("condition_id")) == market.condition_id
-                    ]
                     states = ingest_kacho_ticks(market, kacho)
                     native_samples, gaps = resample_200ms(market, states)
                 else:
                     native_samples, gaps = [], [(market.market_start_ns, market.market_end_ns)]
             except PipelineError:
                 has_pmxt = False
-                kacho = [
-                    row
-                    for row in inputs.kacho_rows
-                    if str(row.get("condition_id")) == market.condition_id
-                ]
                 if kacho:
                     states = ingest_kacho_ticks(market, kacho)
                     native_samples, gaps = resample_200ms(market, states)

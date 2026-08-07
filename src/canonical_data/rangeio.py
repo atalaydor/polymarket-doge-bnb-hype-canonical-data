@@ -11,6 +11,7 @@ from typing import Any, cast
 
 from canonical_data.audit import sha256_bytes
 from canonical_data.errors import ResourceLimitError, SourceError
+from canonical_data.httpclient import USER_AGENT
 
 
 @dataclass(frozen=True)
@@ -81,7 +82,11 @@ class HTTPObjectIdentity:
 def open_http_range(
     url: str, max_transfer_bytes: int
 ) -> tuple[io.BufferedReader, HTTPObjectIdentity, BoundedRangeReader]:
-    head = urllib.request.Request(url, method="HEAD", headers={"Accept-Encoding": "identity"})
+    head = urllib.request.Request(
+        url,
+        method="HEAD",
+        headers={"Accept-Encoding": "identity", "User-Agent": USER_AGENT},
+    )
     try:
         with urllib.request.urlopen(head, timeout=30) as response:
             length_header = response.headers.get("Content-Length")
@@ -100,6 +105,7 @@ def open_http_range(
                 "Range": f"bytes={offset}-{offset + length - 1}",
                 "If-Match": etag,
                 "Accept-Encoding": "identity",
+                "User-Agent": USER_AGENT,
             },
         )
         try:

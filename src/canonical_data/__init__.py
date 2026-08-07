@@ -1,3 +1,3 @@
-"""Chapter 1 deterministic audit helpers."""
+"""Deterministic DOGE/BNB/HYPE historical-data tooling."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

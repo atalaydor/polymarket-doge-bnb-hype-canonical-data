@@ -10,6 +10,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from canonical_data.httpclient import USER_AGENT
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -32,6 +34,7 @@ def offline_audit(root: Path = ROOT) -> dict[str, Any]:
     sources = load_json(root / "config/sources.json")
     scope = load_json(root / "config/scope.json")
     pipeline = load_json(root / "config/pipeline.json")
+    production = load_json(root / "config/production-plan.json")
     schema = load_json(root / "schemas/partition-manifest.schema.json")
     ids = [source["id"] for source in sources["sources"]]
     errors: list[str] = []
@@ -56,6 +59,12 @@ def offline_audit(root: Path = ROOT) -> dict[str, Any]:
         errors.append("disk headroom weakened")
     if limits["minimum_available_memory_bytes"] < 2_000_000_000:
         errors.append("memory headroom weakened")
+    if production["partition"]["count"] != 375:
+        errors.append("finite production partition count changed")
+    if production["execution"]["concurrency"] != 1:
+        errors.append("production concurrency changed")
+    if production["publication"]["maximum_assets_including_index_notice"] > 1000:
+        errors.append("release asset-count bound exceeds GitHub limit")
     return {
         "errors": errors,
         "source_count": len(ids),
@@ -65,7 +74,10 @@ def offline_audit(root: Path = ROOT) -> dict[str, Any]:
 
 def bounded_http_probe(url: str, byte_limit: int = 65536) -> dict[str, Any]:
     """Read at most byte_limit bytes; suitable for metadata/range feasibility only."""
-    request = urllib.request.Request(url, headers={"Range": f"bytes=0-{byte_limit - 1}"})
+    request = urllib.request.Request(
+        url,
+        headers={"Range": f"bytes=0-{byte_limit - 1}", "User-Agent": USER_AGENT},
+    )
     with urllib.request.urlopen(request, timeout=30) as response:
         payload = response.read(byte_limit + 1)
         if len(payload) > byte_limit:

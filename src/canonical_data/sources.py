@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
 from canonical_data.audit import canonical_json_bytes
-from canonical_data.discovery import GammaClient
+from canonical_data.discovery import GammaClient, discover
+from canonical_data.errors import SourceError
 from canonical_data.kacho import read_kacho_parquet
 from canonical_data.manifest import hash_file
 from canonical_data.models import Asset, BookEvent, Market, Provenance
@@ -28,15 +30,36 @@ class PMXTLoad:
 
 
 class ProductionSourceLoader:
-    def __init__(self, gamma: GammaClient, retrieved_at_ns: int):
+    def __init__(
+        self, gamma: GammaClient, retrieved_at_ns: int, official_cache_dir: Path | None = None
+    ):
         self.gamma = gamma
         self.retrieved_at_ns = retrieved_at_ns
+        self.official_cache_dir = official_cache_dir
 
     def discover(self, asset: Asset, market_starts_s: list[int]) -> OfficialDiscovery:
         markets: list[Market] = []
         provenance: list[Provenance] = []
         for start in sorted(set(market_starts_s)):
-            market, payload, url = self.gamma.fetch_market(asset, start)
+            slug = f"{asset.value.lower()}-updown-5m-{start}"
+            cached = self.official_cache_dir / f"{slug}.json" if self.official_cache_dir else None
+            if cached is not None and cached.exists():
+                payload = cached.read_bytes()
+                found = discover([payload])
+                if len(found) != 1 or found[0].asset is not asset:
+                    raise SourceError("cached Gamma identity does not match inventory")
+                market = found[0]
+                url = f"https://gamma-api.polymarket.com/events?slug={slug}"
+            else:
+                market, payload, url = self.gamma.fetch_market(asset, start)
+                if cached is not None:
+                    cached.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = cached.with_suffix(".partial")
+                    with temporary.open("wb") as handle:
+                        handle.write(payload)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(temporary, cached)
             markets.append(market)
             provenance.append(
                 Provenance(
@@ -57,6 +80,8 @@ class ProductionSourceLoader:
         urls: list[str],
         markets: tuple[Market, ...],
         max_transfer_per_object: int = 750_000_000,
+        max_scanned_rows_per_object: int = 25_000_000,
+        max_filtered_rows_per_object: int = 500_000,
     ) -> PMXTLoad:
         conditions = {market.condition_id for market in markets}
         tokens = {token for market in markets for token in (market.token_up, market.token_down)}
@@ -65,7 +90,14 @@ class ProductionSourceLoader:
         for url in sorted(set(urls)):
             reader, identity, raw = open_http_range(url, max_transfer_per_object)
             try:
-                object_events = read_pmxt_parquet(reader, conditions, tokens, url)
+                object_events = read_pmxt_parquet(
+                    reader,
+                    conditions,
+                    tokens,
+                    url,
+                    max_scanned_rows_per_object,
+                    max_filtered_rows_per_object,
+                )
             finally:
                 reader.close()
             ledger = [item.__dict__ for item in raw.ledger]
@@ -92,7 +124,12 @@ class ProductionSourceLoader:
         self, path: Path, markets: tuple[Market, ...]
     ) -> tuple[list[dict[str, object]], Provenance]:
         conditions = {market.condition_id for market in markets}
-        rows = read_kacho_parquet(path, conditions)
+        rows = read_kacho_parquet(
+            path,
+            conditions,
+            start_s=min(market.market_start_ns for market in markets) // 1_000_000_000,
+            end_s=max(market.market_end_ns for market in markets) // 1_000_000_000,
+        )
         length, digest = hash_file(path)
         provenance = Provenance(
             source_id="kacho_5m",

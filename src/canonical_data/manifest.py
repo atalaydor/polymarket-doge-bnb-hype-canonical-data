@@ -134,10 +134,11 @@ def build_release_index(
         manifest = json.loads(payload)
         if canonical_json_bytes(manifest) != payload:
             raise ConflictError("partition manifest is not canonical")
+        asset, timeframe, day = manifest["partition_id"].split("/")
         partitions.append(
             {
                 "partition_id": manifest["partition_id"],
-                "manifest_path": str(manifest_path),
+                "manifest_path": (f"asset={asset}/timeframe={timeframe}/date={day}/manifest.json"),
                 "byte_length": len(payload),
                 "sha256": hashlib.sha256(payload).hexdigest(),
             }

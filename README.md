@@ -19,7 +19,11 @@ factory. Windows is gateway-only; processing occurs in a 2-core GitHub Codespace
 
 See [source authority](docs/source-authority.md), [contract](docs/dataset-contract.md), and
 [architecture](docs/storage-and-execution-architecture.md). Operational ownership is documented in
-[pipeline operations](docs/pipeline-operations.md). Run:
+[pipeline operations](docs/pipeline-operations.md). [Chapter 3 pilot calibration](docs/pilot-calibration.md), its
+[machine-readable measurements](docs/pilot-results.json), and the
+[production plan](config/production-plan.json) freeze the Chapter 4 execution parameters.
+
+Run:
 
 ```bash
 python -m unittest discover -s tests -v

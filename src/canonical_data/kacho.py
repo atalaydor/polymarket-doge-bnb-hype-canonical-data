@@ -19,10 +19,17 @@ def read_kacho_parquet(
     condition_ids: set[str],
     max_file_bytes: int = 250_000_000,
     max_rows: int = 500_000,
+    start_s: int | None = None,
+    end_s: int | None = None,
 ) -> list[dict[str, Any]]:
     if path.stat().st_size > max_file_bytes:
         raise SourceError("Kacho file exceeds configured bound")
-    table = pq.read_table(path, filters=[("condition_id", "in", sorted(condition_ids))])
+    filters: list[tuple[str, str, object]] = [("condition_id", "in", sorted(condition_ids))]
+    if start_s is not None:
+        filters.append(("t", ">=", start_s))
+    if end_s is not None:
+        filters.append(("t", "<", end_s))
+    table = pq.read_table(path, filters=filters)
     if table.num_rows > max_rows:
         raise SourceError("Kacho filtered rows exceed configured bound")
     if "condition_id" not in table.column_names:

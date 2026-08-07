@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 
 import pyarrow as pa
@@ -137,14 +138,71 @@ class PmxtTests(unittest.TestCase):
         states = BookReconstructor().reconstruct(decode_rows(rows, "fixture"))
         self.assertEqual([item for item in states if item.token_id == "1"][-1].bids, ())
 
-    def test_duplicate_is_deduplicated_but_conflict_fails(self) -> None:
+    def test_duplicate_is_deduplicated_and_same_timestamp_updates_remain_ordered(self) -> None:
         rows = pmxt_rows(False)
         events = decode_rows([*rows, dict(rows[0])], "fixture")
         self.assertEqual(len(events), 2)
         conflicting = dict(rows[0])
         conflicting["bids"] = '[["0.40","11"]]'
-        with self.assertRaises(ReconstructionError):
-            decode_rows([*rows, conflicting], "fixture")
+        ordered = decode_rows([*rows, conflicting], "fixture")
+        self.assertEqual(len(ordered), 3)
+        changed = next(
+            event for event in ordered if event.bids and event.bids[0].size == Decimal("11")
+        )
+        original = next(
+            event for event in ordered if event.bids and event.bids[0].size == Decimal("10")
+        )
+        self.assertGreater(changed.source_row, original.source_row)
+
+    def test_flattened_price_change_batch_validates_after_all_rows(self) -> None:
+        snapshot = pmxt_rows(False)[0]
+        delete = {
+            **pmxt_rows()[2],
+            "timestamp_received": START_NS // 1_000_000 + 10,
+            "timestamp": START_NS // 1_000_000 + 9,
+            "side": "SELL",
+            "price": "0.60",
+            "size": "0",
+            "best_bid": "0.40",
+            "best_ask": "0.70",
+        }
+        replacement = {
+            **delete,
+            "timestamp": START_NS // 1_000_000 + 10,
+            "price": "0.70",
+            "size": "8",
+        }
+        states = BookReconstructor().reconstruct(
+            decode_rows([snapshot, delete, replacement], "fixture")
+        )
+        self.assertEqual(states[-1].asks[0].price, Decimal("0.70"))
+
+    def test_native_bbo_prunes_stale_better_level_without_zero_update(self) -> None:
+        snapshot = pmxt_rows(False)[0]
+        inward = {
+            **pmxt_rows()[2],
+            "side": "BUY",
+            "price": "0.30",
+            "size": "12",
+            "best_bid": "0.30",
+            "best_ask": "0.60",
+        }
+        states = BookReconstructor().reconstruct(decode_rows([snapshot, inward], "fixture"))
+        self.assertEqual(states[-1].bids[0].price, Decimal("0.30"))
+        self.assertNotIn(Decimal("0.40"), {level.price for level in states[-1].bids})
+
+    def test_native_empty_side_bbo_sentinel_is_not_a_quote(self) -> None:
+        snapshot = pmxt_rows(False)[0]
+        empty_bid = {
+            **pmxt_rows()[2],
+            "side": "BUY",
+            "price": "0.40",
+            "size": "0",
+            "best_bid": "0",
+            "best_ask": "0.60",
+        }
+        states = BookReconstructor().reconstruct(decode_rows([snapshot, empty_bid], "fixture"))
+        self.assertEqual(states[-1].bids, ())
 
     def test_increment_or_tick_before_snapshot_fails(self) -> None:
         increment = pmxt_rows()[2]

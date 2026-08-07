@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import BinaryIO, Protocol
 
 from canonical_data.errors import ResourceLimitError, SourceError
+from canonical_data.httpclient import USER_AGENT
 from canonical_data.inventory import SourceObject
 
 
@@ -56,7 +57,10 @@ class BoundedAcquirer:
         partial = final.with_suffix(".partial")
         if final.exists():
             return self._verify_existing(source, final)
-        request = urllib.request.Request(source.url, headers={"Accept-Encoding": "identity"})
+        request = urllib.request.Request(
+            source.url,
+            headers={"Accept-Encoding": "identity", "User-Agent": USER_AGENT},
+        )
         digest = hashlib.sha256()
         total = 0
         etag: str | None = None

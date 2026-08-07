@@ -50,7 +50,7 @@ def read_pmxt_parquet(
     condition_ids: set[str],
     token_ids: set[str],
     source_object: str,
-    max_scanned_rows: int = 2_100_000,
+    max_scanned_rows: int = 25_000_000,
     max_output_rows: int = 500_000,
 ) -> list[BookEvent]:
     if not condition_ids or not token_ids:
@@ -75,13 +75,19 @@ def read_pmxt_parquet(
             selected.append(index)
     if not selected:
         return []
-    table = parquet.read_row_groups(selected, columns=PMXT_COLUMNS)
     market_values = pa.array(sorted(encoded), type=pa.binary(66))
-    table = table.filter(pc.is_in(table["market"], value_set=market_values))
-    table = table.filter(pc.is_in(table["asset_id"], value_set=pa.array(sorted(token_ids))))
-    if table.num_rows > max_output_rows:
-        raise ResourceLimitError("PMXT filtered output exceeds row cap")
-    return decode_rows(table.to_pylist(), source_object)
+    token_values = pa.array(sorted(token_ids))
+    events: list[BookEvent] = []
+    row_offset = 0
+    for index in selected:
+        table = parquet.read_row_group(index, columns=PMXT_COLUMNS)
+        table = table.filter(pc.is_in(table["market"], value_set=market_values))
+        table = table.filter(pc.is_in(table["asset_id"], value_set=token_values))
+        if len(events) + table.num_rows > max_output_rows:
+            raise ResourceLimitError("PMXT filtered output exceeds row cap")
+        events.extend(decode_rows(table.to_pylist(), source_object, row_offset))
+        row_offset += parquet.metadata.row_group(index).num_rows
+    return order_and_deduplicate(events)
 
 
 def _decimal(value: Any, name: str, nullable: bool = True) -> Decimal | None:
@@ -136,7 +142,9 @@ def _levels(value: Any, side: str) -> tuple[Level, ...]:
     return ordered
 
 
-def decode_rows(rows: Iterable[dict[str, Any]], source_object: str) -> list[BookEvent]:
+def decode_rows(
+    rows: Iterable[dict[str, Any]], source_object: str, source_row_offset: int = 0
+) -> list[BookEvent]:
     decoded: list[BookEvent] = []
     for source_row, raw in enumerate(rows):
         try:
@@ -163,7 +171,7 @@ def decode_rows(rows: Iterable[dict[str, Any]], source_object: str) -> list[Book
             source_ts_ns=source_ts,
             receive_ts_ns=receive_ts,
             source_object=source_object,
-            source_row=source_row,
+            source_row=source_row + source_row_offset,
             sequence=0,
             event_type=event_type,
             bids=bids,
@@ -229,25 +237,11 @@ def order_and_deduplicate(events: Iterable[BookEvent]) -> list[BookEvent]:
         events, key=lambda event: (event.condition_id, event.token_id, event.order_key)
     )
     fingerprints: set[str] = set()
-    collision: dict[tuple[Any, ...], str] = {}
     result: list[BookEvent] = []
     for event in ordered:
         fingerprint = _event_fingerprint(event)
         if fingerprint in fingerprints:
             continue
-        identity = (
-            event.condition_id,
-            event.token_id,
-            event.receive_ts_ns,
-            event.source_ts_ns,
-            event.event_type,
-            event.side,
-            event.price,
-        )
-        previous = collision.get(identity)
-        if previous is not None and previous != fingerprint:
-            raise ReconstructionError("conflicting events share an immutable identity")
-        collision[identity] = fingerprint
         fingerprints.add(fingerprint)
         result.append(event)
     return [
@@ -274,7 +268,7 @@ class BookReconstructor:
         asks: dict[Decimal, Decimal] | None = None
         tick_size: Decimal | None = None
         states: list[BookState] = []
-        for event in events:
+        for event_index, event in enumerate(events):
             if event.event_type is EventType.BOOK:
                 if event.receive_ts_ns is None:
                     raise ReconstructionError("PMXT event lacks receive timestamp")
@@ -300,20 +294,44 @@ class BookReconstructor:
                 continue
             if bids is None or asks is None:
                 continue
+            next_event = events[event_index + 1] if event_index + 1 < len(events) else None
+            batch_end = next_event is None or next_event.receive_ts_ns != event.receive_ts_ns
+            if batch_end and event.event_type is EventType.PRICE_CHANGE:
+                if event.best_bid is not None:
+                    bids = (
+                        {}
+                        if event.best_bid == 0
+                        else {
+                            price: size for price, size in bids.items() if price <= event.best_bid
+                        }
+                    )
+                if event.best_ask is not None:
+                    asks = (
+                        {}
+                        if event.best_ask == 1
+                        else {
+                            price: size for price, size in asks.items() if price >= event.best_ask
+                        }
+                    )
             bid_levels = tuple(
                 Level(price, size) for price, size in sorted(bids.items(), reverse=True)
             )
             ask_levels = tuple(Level(price, size) for price, size in sorted(asks.items()))
-            if bid_levels and ask_levels and bid_levels[0].price >= ask_levels[0].price:
-                raise ReconstructionError("crossed or locked book")
-            if event.best_bid is not None:
-                actual_bid = bid_levels[0].price if bid_levels else None
-                if actual_bid != event.best_bid:
-                    raise ReconstructionError("best bid disagrees with reconstructed book")
-            if event.best_ask is not None:
-                actual_ask = ask_levels[0].price if ask_levels else None
-                if actual_ask != event.best_ask:
-                    raise ReconstructionError("best ask disagrees with reconstructed book")
+            if batch_end:
+                if bid_levels and ask_levels and bid_levels[0].price >= ask_levels[0].price:
+                    raise ReconstructionError("crossed or locked book")
+                if event.best_bid is not None:
+                    actual_bid = bid_levels[0].price if bid_levels else None
+                    claimed_bid = None if event.best_bid == 0 else event.best_bid
+                    if actual_bid != claimed_bid:
+                        detail = f"reconstructed={actual_bid}, claimed={event.best_bid}"
+                        raise ReconstructionError(f"best bid disagrees: {detail}")
+                if event.best_ask is not None:
+                    actual_ask = ask_levels[0].price if ask_levels else None
+                    claimed_ask = None if event.best_ask == 1 else event.best_ask
+                    if actual_ask != claimed_ask:
+                        detail = f"reconstructed={actual_ask}, claimed={event.best_ask}"
+                        raise ReconstructionError(f"best ask disagrees: {detail}")
             states.append(
                 BookState(
                     condition_id=event.condition_id,

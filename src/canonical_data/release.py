@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from canonical_data.errors import ConflictError, ResourceLimitError, SourceError
+from canonical_data.httpclient import USER_AGENT
 from canonical_data.manifest import hash_file
 
 MAX_RELEASE_ASSET_BYTES = 1_900_000_000
@@ -66,11 +67,14 @@ class Publisher:
             if length >= MAX_RELEASE_ASSET_BYTES:
                 raise ResourceLimitError("release asset exceeds repository cap")
             name = content_addressed_name(partition_id, path, digest)
+            logical_prefix = f"{partition_id.replace('/', '--')}--"
             logical_suffix = f"--{path.name}"
             conflicts = [
                 item
                 for item in existing.values()
-                if item.name.endswith(logical_suffix) and item.name != name
+                if item.name.startswith(logical_prefix)
+                and item.name.endswith(logical_suffix)
+                and item.name != name
             ]
             if conflicts:
                 raise ConflictError(f"conflicting remote asset identity: {path.name}")
@@ -166,6 +170,7 @@ class GitHubReleaseBackend:
                 "Accept": "application/vnd.github+json",
                 "Content-Type": content_type,
                 "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": USER_AGENT,
             },
         )
         try:
@@ -176,13 +181,21 @@ class GitHubReleaseBackend:
         return json.loads(body) if body else None
 
     def ensure_draft(self, tag: str) -> str:
-        try:
-            release = self._request("GET", f"{self.api}/releases/tags/{urllib.parse.quote(tag)}")
+        matches: list[dict[str, Any]] = []
+        for page in range(1, 11):
+            releases = self._request("GET", f"{self.api}/releases?per_page=100&page={page}")
+            matches.extend(item for item in releases if item.get("tag_name") == tag)
+            if len(releases) < 100:
+                break
+        else:
+            raise ResourceLimitError("GitHub release inventory exceeds bounded lookup")
+        if len(matches) > 1:
+            raise ConflictError("multiple GitHub releases share the staged tag")
+        if matches:
+            release = matches[0]
             if not release.get("draft"):
                 raise ConflictError("existing release is not staged as draft")
-        except GitHubAPIError as exc:
-            if exc.code != 404:
-                raise
+        else:
             payload = json.dumps(
                 {"tag_name": tag, "name": tag, "draft": True, "prerelease": False}
             ).encode()
@@ -221,6 +234,7 @@ class GitHubReleaseBackend:
         connection.putheader("Content-Type", "application/octet-stream")
         connection.putheader("Content-Length", str(length))
         connection.putheader("X-GitHub-Api-Version", "2022-11-28")
+        connection.putheader("User-Agent", USER_AGENT)
         connection.endheaders()
         with path.open("rb") as handle:
             while chunk := handle.read(1_048_576):
@@ -245,6 +259,7 @@ class GitHubReleaseBackend:
                 "Authorization": f"Bearer {self.token}",
                 "Accept": "application/octet-stream",
                 "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": USER_AGENT,
             },
         )
         with urllib.request.urlopen(request, timeout=120) as response, target.open("wb") as handle:
