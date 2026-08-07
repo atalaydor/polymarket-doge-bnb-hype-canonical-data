@@ -161,7 +161,7 @@ def _load_pmxt_hour(
             loaded = loader.load_downloaded_pmxt(
                 acquired.path, source.url, markets, acquired.etag
             )
-            acquired.path.unlink()
+            acquired.path.unlink(missing_ok=True)
             return loaded
         except (SourceError, urllib.error.URLError, TimeoutError) as exc:
             last = exc
@@ -252,7 +252,7 @@ def prepare_shared_day(
             state["completed_urls"][source.url] = by_asset
             state["source_bytes"] = int(state["source_bytes"]) + acquired.byte_length
             _atomic_json(state_path, state)
-            acquired.path.unlink()
+            acquired.path.unlink(missing_ok=True)
     provenance = {
         asset: tuple(
             _provenance_from_json(item[asset.value])
