@@ -33,6 +33,7 @@ from canonical_data.release import (
     download_and_verify_release,
 )
 from canonical_data.resample import resample_200ms
+from canonical_data.spool import EventSpool
 from canonical_data.state import Checkpoint, Phase, StateStore
 
 COMMIT = "d" * 40
@@ -163,6 +164,37 @@ class StateTests(unittest.TestCase):
 
 
 class PipelineTests(unittest.TestCase):
+    def test_disk_spool_pipeline_is_bounded_and_byte_deterministic(self) -> None:
+        decoded = decode_rows(pmxt_rows(), "fixture")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            digests: list[str] = []
+            files: list[bytes] = []
+            for name in ("one", "two"):
+                spool_path = root / f"{name}.sqlite"
+                with EventSpool(spool_path) as spool:
+                    self.assertEqual(spool.append(reversed(decoded)), len(decoded))
+                    self.assertEqual(spool.count(), len(decoded))
+                built = Pipeline(
+                    root / name / "out", StateStore(root / name / "state"), COMMIT
+                ).build(
+                    PartitionInputs(
+                        Asset.DOGE,
+                        "2026-04-13",
+                        (market(),),
+                        event_spool_path=spool_path,
+                        provenance=(provenance(),),
+                    ),
+                    market().market_end_ns,
+                )
+                digests.append(built.manifest_digest)
+                files.append((built.directory / "book-events.parquet").read_bytes())
+                self.assertGreater(
+                    pq.read_metadata(built.directory / "book-200ms.parquet").num_rows, 0
+                )
+            self.assertEqual(digests[0], digests[1])
+            self.assertEqual(files[0], files[1])
+
     def test_invalid_kacho_market_is_evidence_backed_exclusion_not_partition_abort(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

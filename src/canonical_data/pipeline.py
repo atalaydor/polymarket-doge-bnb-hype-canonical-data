@@ -29,13 +29,21 @@ from canonical_data.parquetio import (
     MARKET_SCHEMA,
     SAMPLE_SCHEMA,
     UNDERLYING_SCHEMA,
+    StreamingTableWriter,
+    event_row,
+    exclusion_row,
+    market_row,
+    sample_row,
+    underlying_row,
     verify_parquet,
     write_partition_tables,
+    write_table_atomic,
 )
 from canonical_data.pmxt import BookReconstructor, decode_rows
 from canonical_data.quality import classify
 from canonical_data.release import Publisher, ReleaseAsset
 from canonical_data.resample import resample_200ms
+from canonical_data.spool import EventSpool
 from canonical_data.state import ORDER, Checkpoint, Phase, StateStore
 
 
@@ -51,6 +59,7 @@ class PartitionInputs:
     provenance: tuple[Provenance, ...] = ()
     temporary_raw_paths: tuple[Path, ...] = ()
     decoded_pmxt_events: tuple[BookEvent, ...] = ()
+    event_spool_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -124,16 +133,35 @@ class Pipeline:
         exclusions: list[Exclusion] = []
         accepted_markets: list[Market] = []
         partition_tiers: list[QualityTier] = []
-        if inputs.decoded_pmxt_events and inputs.pmxt_rows:
-            raise PipelineError("provide raw or decoded PMXT events, not both")
+        modes = sum(
+            bool(item)
+            for item in (
+                inputs.decoded_pmxt_events,
+                inputs.pmxt_rows,
+                inputs.event_spool_path,
+            )
+        )
+        if modes > 1:
+            raise PipelineError("provide exactly one PMXT event input mode")
         pmxt_events = list(inputs.decoded_pmxt_events)
         if inputs.pmxt_rows:
             pmxt_events = decode_rows(inputs.pmxt_rows, inputs.pmxt_source_object)
         self._advance_if_needed(partition_id, Phase.ACQUIRED, identity_digest)
-        for market in inputs.markets:
+        event_writer = None
+        sample_writer = None
+        sample_min: int | None = None
+        sample_max: int | None = None
+        event_count = 0
+        sample_count = 0
+        spool = EventSpool(inputs.event_spool_path) if inputs.event_spool_path else None
+        if spool is not None:
+            event_writer = StreamingTableWriter(directory / "book-events.parquet", EVENT_SCHEMA)
+            sample_writer = StreamingTableWriter(directory / "book-200ms.parquet", SAMPLE_SCHEMA)
+        ordered_markets = sorted(inputs.markets, key=lambda item: item.condition_id)
+        for market in ordered_markets:
             if market.asset is not inputs.asset:
                 raise PipelineError("market asset does not match partition")
-            market_events = [
+            market_events = spool.load(market.condition_id) if spool else [
                 event for event in pmxt_events if event.condition_id == market.condition_id
             ]
             kacho = [
@@ -182,19 +210,78 @@ class Pipeline:
                 continue
             accepted_markets.append(Market(**{**market.__dict__, "quality_tier": tier}))
             partition_tiers.append(tier)
-            samples.extend(native_samples)
-            if len(samples) > self.limits.max_samples:
+            sample_count += len(native_samples)
+            if sample_count > self.limits.max_samples:
                 raise ResourceLimitError("derived samples exceed partition cap")
+            if native_samples:
+                sample_min = (
+                    native_samples[0].grid_ts_ns
+                    if sample_min is None
+                    else min(sample_min, native_samples[0].grid_ts_ns)
+                )
+                sample_max = (
+                    native_samples[-1].grid_ts_ns
+                    if sample_max is None
+                    else max(sample_max, native_samples[-1].grid_ts_ns)
+                )
             if tier is QualityTier.TIER_A:
-                events.extend(market_events)
+                native_events = market_events
             else:
-                events.extend(kacho_native_events(states))
+                native_events = kacho_native_events(states)
+            event_count += len(native_events)
+            if event_writer is not None and sample_writer is not None:
+                event_writer.append([event_row(item) for item in native_events])
+                sample_writer.append([sample_row(item) for item in native_samples])
+            else:
+                events.extend(native_events)
+                samples.extend(native_samples)
         tier = self._partition_tier(partition_tiers)
         if tier is QualityTier.EXCLUDED:
             raise PipelineError("partition has no publishable markets")
-        counts = write_partition_tables(
-            directory, accepted_markets, events, samples, inputs.underlying, exclusions
-        )
+        if spool is None:
+            counts = write_partition_tables(
+                directory, accepted_markets, events, samples, inputs.underlying, exclusions
+            )
+        else:
+            assert event_writer is not None and sample_writer is not None
+            counts = {
+                "book-events.parquet": event_writer.finish(),
+                "book-200ms.parquet": sample_writer.finish(),
+            }
+            small = (
+                (
+                    "markets.parquet",
+                    MARKET_SCHEMA,
+                    sorted(
+                        (market_row(item) for item in accepted_markets),
+                        key=lambda row: row["condition_id"],
+                    ),
+                ),
+                (
+                    "underlying.parquet",
+                    UNDERLYING_SCHEMA,
+                    sorted(
+                        (underlying_row(item) for item in inputs.underlying),
+                        key=lambda row: (
+                            row["asset"],
+                            row["source_ts_ns"],
+                            row["observation_kind"],
+                        ),
+                    ),
+                ),
+                (
+                    "exclusions.parquet",
+                    EXCLUSION_SCHEMA,
+                    sorted(
+                        (exclusion_row(item) for item in exclusions),
+                        key=lambda row: (row["market_id"], row["reason_code"]),
+                    ),
+                ),
+            )
+            for name, schema, rows in small:
+                write_table_atomic(directory / name, schema, rows)
+                counts[name] = len(rows)
+            spool.close()
         partition_bytes = sum(path.stat().st_size for path in directory.glob("*.parquet"))
         if partition_bytes > self.limits.max_partition_bytes:
             raise ResourceLimitError("transformed partition exceeds byte cap")
@@ -212,8 +299,12 @@ class Pipeline:
             "row_counts": counts,
             "market_count": len(accepted_markets),
             "exclusion_count": len(exclusions),
-            "sample_min_ts_ns": min((item.grid_ts_ns for item in samples), default=None),
-            "sample_max_ts_ns": max((item.grid_ts_ns for item in samples), default=None),
+            "sample_min_ts_ns": sample_min
+            if spool is not None
+            else min((item.grid_ts_ns for item in samples), default=None),
+            "sample_max_ts_ns": sample_max
+            if spool is not None
+            else max((item.grid_ts_ns for item in samples), default=None),
         }
         _, digest = build_manifest(
             directory,

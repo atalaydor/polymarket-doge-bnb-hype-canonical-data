@@ -130,7 +130,7 @@ def _level_rows(levels: Sequence[Level] | None) -> list[dict[str, Decimal]] | No
     return [{"price": level.price, "size": level.size} for level in levels]
 
 
-def _market_row(market: Market) -> dict[str, Any]:
+def market_row(market: Market) -> dict[str, Any]:
     return {
         **asdict(market),
         "asset": market.asset.value,
@@ -140,7 +140,7 @@ def _market_row(market: Market) -> dict[str, Any]:
     }
 
 
-def _event_row(event: BookEvent) -> dict[str, Any]:
+def event_row(event: BookEvent) -> dict[str, Any]:
     return {
         **asdict(event),
         "event_type": event.event_type.value,
@@ -149,7 +149,7 @@ def _event_row(event: BookEvent) -> dict[str, Any]:
     }
 
 
-def _sample_row(sample: Sample200ms) -> dict[str, Any]:
+def sample_row(sample: Sample200ms) -> dict[str, Any]:
     return {
         **asdict(sample),
         "quality_tier": sample.quality_tier.value,
@@ -158,11 +158,11 @@ def _sample_row(sample: Sample200ms) -> dict[str, Any]:
     }
 
 
-def _underlying_row(item: UnderlyingObservation) -> dict[str, Any]:
+def underlying_row(item: UnderlyingObservation) -> dict[str, Any]:
     return {**asdict(item), "asset": item.asset.value}
 
 
-def _exclusion_row(item: Exclusion) -> dict[str, Any]:
+def exclusion_row(item: Exclusion) -> dict[str, Any]:
     return {
         "market_id": item.market_id,
         "reason_code": item.reason_code.value,
@@ -194,6 +194,50 @@ def write_table_atomic(path: Path, schema: pa.Schema, rows: list[dict[str, Any]]
     os.replace(temporary, path)
 
 
+class StreamingTableWriter:
+    """Write already-sorted batches with the pinned deterministic Parquet settings."""
+
+    def __init__(self, path: Path, schema: pa.Schema):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
+        self.schema = schema
+        self.temporary = path.with_suffix(path.suffix + ".partial")
+        self.temporary.unlink(missing_ok=True)
+        self.writer = pq.ParquetWriter(
+            self.temporary,
+            schema,
+            compression="zstd",
+            compression_level=9,
+            use_dictionary=False,
+            write_statistics=True,
+            data_page_version="2.0",
+            version="2.6",
+        )
+        self.rows = 0
+
+    def append(self, rows: list[dict[str, Any]]) -> None:
+        if not rows:
+            return
+        self.writer.write_table(
+            pa.Table.from_pylist(rows, schema=self.schema), row_group_size=65_536
+        )
+        self.rows += len(rows)
+
+    def finish(self) -> int:
+        self.writer.close()
+        with self.temporary.open("rb") as handle:
+            os.fsync(handle.fileno())
+        if self.path.exists() and self.path.read_bytes() != self.temporary.read_bytes():
+            self.temporary.unlink()
+            raise ConflictError(f"refusing to replace conflicting output: {self.path.name}")
+        os.replace(self.temporary, self.path)
+        return self.rows
+
+    def abort(self) -> None:
+        self.writer.close()
+        self.temporary.unlink(missing_ok=True)
+
+
 def write_partition_tables(
     directory: Path,
     markets: Iterable[Market],
@@ -206,13 +250,13 @@ def write_partition_tables(
         (
             "markets.parquet",
             MARKET_SCHEMA,
-            sorted((_market_row(item) for item in markets), key=lambda row: row["condition_id"]),
+            sorted((market_row(item) for item in markets), key=lambda row: row["condition_id"]),
         ),
         (
             "book-events.parquet",
             EVENT_SCHEMA,
             sorted(
-                (_event_row(item) for item in events),
+                (event_row(item) for item in events),
                 key=lambda row: (
                     row["condition_id"],
                     row["token_id"],
@@ -225,7 +269,7 @@ def write_partition_tables(
             "book-200ms.parquet",
             SAMPLE_SCHEMA,
             sorted(
-                (_sample_row(item) for item in samples),
+                (sample_row(item) for item in samples),
                 key=lambda row: (row["condition_id"], row["token_id"], row["grid_ts_ns"]),
             ),
         ),
@@ -233,7 +277,7 @@ def write_partition_tables(
             "underlying.parquet",
             UNDERLYING_SCHEMA,
             sorted(
-                (_underlying_row(item) for item in underlying),
+                (underlying_row(item) for item in underlying),
                 key=lambda row: (row["asset"], row["source_ts_ns"], row["observation_kind"]),
             ),
         ),
@@ -241,7 +285,7 @@ def write_partition_tables(
             "exclusions.parquet",
             EXCLUSION_SCHEMA,
             sorted(
-                (_exclusion_row(item) for item in exclusions),
+                (exclusion_row(item) for item in exclusions),
                 key=lambda row: (row["market_id"], row["reason_code"]),
             ),
         ),
