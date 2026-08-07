@@ -175,6 +175,7 @@ class PipelineTests(unittest.TestCase):
                 with EventSpool(spool_path) as spool:
                     self.assertEqual(spool.append(reversed(decoded)), len(decoded))
                     self.assertEqual(spool.count(), len(decoded))
+                    self.assertEqual(spool.count_condition(market().condition_id), len(decoded))
                 built = Pipeline(
                     root / name / "out", StateStore(root / name / "state"), COMMIT
                 ).build(

@@ -56,6 +56,13 @@ class EventSpool:
         assert value is not None
         return int(value[0])
 
+    def count_condition(self, condition_id: str) -> int:
+        value = self.connection.execute(
+            "SELECT COUNT(*) FROM events WHERE condition_id=?", (condition_id,)
+        ).fetchone()
+        assert value is not None
+        return int(value[0])
+
     def close(self) -> None:
         self.connection.close()
 
