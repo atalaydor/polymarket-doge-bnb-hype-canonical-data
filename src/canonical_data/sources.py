@@ -120,6 +120,39 @@ class ProductionSourceLoader:
             )
         return PMXTLoad(tuple(events), tuple(provenance))
 
+    def load_downloaded_pmxt(
+        self,
+        path: Path,
+        source_url: str,
+        markets: tuple[Market, ...],
+        etag: str | None,
+        max_filtered_rows: int = 500_000,
+    ) -> PMXTLoad:
+        """Filter one bounded whole-object fallback without retaining the raw archive."""
+        conditions = {market.condition_id for market in markets}
+        tokens = {token for market in markets for token in (market.token_up, market.token_down)}
+        length, digest = hash_file(path)
+        events = read_pmxt_parquet(
+            path,
+            conditions,
+            tokens,
+            source_url,
+            max_scanned_rows=2_000_000_000,
+            max_output_rows=max_filtered_rows,
+        )
+        provenance = Provenance(
+            source_id="pmxt_v2",
+            source_url=source_url,
+            retrieved_at_ns=self.retrieved_at_ns,
+            byte_length=length,
+            sha256=digest,
+            license_id="CC-BY-4.0",
+            source_precision="ms",
+            etag=etag,
+            transformations=("bounded_whole_object_fallback", "condition_token_filter"),
+        )
+        return PMXTLoad(tuple(events), (provenance,))
+
     def load_kacho(
         self, path: Path, markets: tuple[Market, ...]
     ) -> tuple[list[dict[str, object]], Provenance]:

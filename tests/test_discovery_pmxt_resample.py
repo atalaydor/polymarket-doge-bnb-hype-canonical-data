@@ -22,6 +22,7 @@ from canonical_data.errors import (
 from canonical_data.models import EventType
 from canonical_data.pmxt import PMXT_COLUMNS, BookReconstructor, decode_rows, read_pmxt_parquet
 from canonical_data.resample import resample_200ms
+from canonical_data.sources import ProductionSourceLoader
 
 
 class DiscoveryTests(unittest.TestCase):
@@ -110,6 +111,14 @@ class PmxtTests(unittest.TestCase):
             self.assertEqual(found[0].condition_id, CONDITION)
             with self.assertRaises(ResourceLimitError):
                 read_pmxt_parquet(path, {CONDITION}, {"1"}, "fixture", max_scanned_rows=0)
+            downloaded = ProductionSourceLoader(GammaClient(), 7).load_downloaded_pmxt(
+                path, "https://example.test/hour.parquet", (market(),), '"etag"'
+            )
+            self.assertEqual(len(downloaded.events), 1)
+            self.assertEqual(
+                downloaded.provenance[0].transformations[0],
+                "bounded_whole_object_fallback",
+            )
 
     def test_every_event_type_and_reconstruction(self) -> None:
         events = decode_rows(pmxt_rows(), "fixture.parquet")

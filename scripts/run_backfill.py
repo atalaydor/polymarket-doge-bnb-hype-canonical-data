@@ -21,10 +21,11 @@ from canonical_data.acquire import BoundedAcquirer
 from canonical_data.audit import canonical_json_bytes
 from canonical_data.binance import ingest_binance_zip
 from canonical_data.discovery import GammaClient
+from canonical_data.errors import ResourceLimitError, SourceError
 from canonical_data.httpclient import USER_AGENT
 from canonical_data.inventory import SourceObject, pmxt_hourly_objects
 from canonical_data.manifest import hash_file
-from canonical_data.models import Asset, Provenance
+from canonical_data.models import Asset, Market, Provenance
 from canonical_data.pipeline import PartitionInputs, Pipeline, PipelineLimits
 from canonical_data.release import GitHubReleaseBackend, Publisher
 from canonical_data.sources import ProductionSourceLoader
@@ -114,7 +115,7 @@ def _expected_market_starts(day: date) -> list[int]:
 
 
 def _retry_pmxt(
-    loader: ProductionSourceLoader, url: str, markets: tuple[Any, ...]
+    loader: ProductionSourceLoader, url: str, markets: tuple[Market, ...]
 ) -> Any:
     last: Exception | None = None
     for attempt, delay in enumerate((0, *RETRY_DELAYS)):
@@ -122,13 +123,45 @@ def _retry_pmxt(
             time.sleep(delay)
         try:
             return loader.load_pmxt([url], markets)
-        except (urllib.error.URLError, TimeoutError) as exc:
+        except ResourceLimitError:
+            raise
+        except (SourceError, urllib.error.URLError, TimeoutError) as exc:
             last = exc
         if attempt == len(RETRY_DELAYS):
             break
     if last is not None:
         raise last
     raise AssertionError("unreachable PMXT retry state")
+
+
+def _load_pmxt_hour(
+    loader: ProductionSourceLoader,
+    source: SourceObject,
+    markets: tuple[Market, ...],
+    raw_dir: Path,
+) -> Any:
+    try:
+        return _retry_pmxt(loader, source.url, markets)
+    except ResourceLimitError as exc:
+        if "selected row groups exceed scan-row cap" not in str(exc):
+            raise
+    last: Exception | None = None
+    for attempt, delay in enumerate((0, *RETRY_DELAYS)):
+        if delay:
+            time.sleep(delay)
+        try:
+            acquired = BoundedAcquirer(raw_dir, 750_000_000, 8_000_000_000).acquire(source)
+            loaded = loader.load_downloaded_pmxt(
+                acquired.path, source.url, markets, acquired.etag
+            )
+            acquired.path.unlink()
+            return loaded
+        except (SourceError, urllib.error.URLError, TimeoutError) as exc:
+            last = exc
+        if attempt == len(RETRY_DELAYS):
+            break
+    assert last is not None
+    raise last
 
 
 def run_tier_b(
@@ -254,7 +287,7 @@ def run_partition(
     day_end_ns = day_start_ns + 86_400_000_000_000
     with EventSpool(spool_path) as spool:
         for source in pmxt_hourly_objects(inventory_start_ns, day_end_ns):
-            loaded = _retry_pmxt(loader, source.url, discovered.markets)
+            loaded = _load_pmxt_hour(loader, source, discovered.markets, work / "raw-pmxt")
             pmxt_events += spool.append(loaded.events)
             pmxt_provenance.extend(loaded.provenance)
     kacho_rows: list[dict[str, object]] = []
