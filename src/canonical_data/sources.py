@@ -12,7 +12,7 @@ from canonical_data.discovery import GammaClient, discover
 from canonical_data.errors import SourceError
 from canonical_data.kacho import read_kacho_parquet
 from canonical_data.manifest import hash_file
-from canonical_data.models import Asset, BookEvent, Market, Provenance
+from canonical_data.models import Asset, BookEvent, Exclusion, ExclusionReason, Market, Provenance
 from canonical_data.pmxt import read_pmxt_parquet
 from canonical_data.rangeio import open_http_range
 
@@ -21,6 +21,7 @@ from canonical_data.rangeio import open_http_range
 class OfficialDiscovery:
     markets: tuple[Market, ...]
     provenance: tuple[Provenance, ...]
+    exclusions: tuple[Exclusion, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -37,21 +38,20 @@ class ProductionSourceLoader:
         self.retrieved_at_ns = retrieved_at_ns
         self.official_cache_dir = official_cache_dir
 
-    def discover(self, asset: Asset, market_starts_s: list[int]) -> OfficialDiscovery:
+    def discover(
+        self, asset: Asset, market_starts_s: list[int], allow_missing: bool = False
+    ) -> OfficialDiscovery:
         markets: list[Market] = []
         provenance: list[Provenance] = []
+        exclusions: list[Exclusion] = []
         for start in sorted(set(market_starts_s)):
             slug = f"{asset.value.lower()}-updown-5m-{start}"
             cached = self.official_cache_dir / f"{slug}.json" if self.official_cache_dir else None
             if cached is not None and cached.exists():
                 payload = cached.read_bytes()
-                found = discover([payload])
-                if len(found) != 1 or found[0].asset is not asset:
-                    raise SourceError("cached Gamma identity does not match inventory")
-                market = found[0]
                 url = f"https://gamma-api.polymarket.com/events?slug={slug}"
             else:
-                market, payload, url = self.gamma.fetch_market(asset, start)
+                payload, url = self.gamma.fetch_slug_payload(asset, start)
                 if cached is not None:
                     cached.parent.mkdir(parents=True, exist_ok=True)
                     temporary = cached.with_suffix(".partial")
@@ -60,7 +60,22 @@ class ProductionSourceLoader:
                         handle.flush()
                         os.fsync(handle.fileno())
                     os.replace(temporary, cached)
-            markets.append(market)
+            found = discover([payload])
+            if len(found) == 1 and found[0].asset is asset:
+                if found[0].market_start_ns != start * 1_000_000_000:
+                    raise SourceError("Gamma start does not match inventory")
+                markets.append(found[0])
+            elif allow_missing and not found:
+                exclusions.append(
+                    Exclusion(
+                        slug,
+                        ExclusionReason.SOURCE_GAP,
+                        "official Gamma slug returned no market",
+                        {"payload_sha256": hashlib.sha256(payload).hexdigest()},
+                    )
+                )
+            else:
+                raise SourceError("Gamma identity does not match inventory")
             provenance.append(
                 Provenance(
                     source_id="polymarket_gamma_clob",
@@ -73,7 +88,7 @@ class ProductionSourceLoader:
                     transformations=("minimum_identity_rules_resolution_binding",),
                 )
             )
-        return OfficialDiscovery(tuple(markets), tuple(provenance))
+        return OfficialDiscovery(tuple(markets), tuple(provenance), tuple(exclusions))
 
     def load_pmxt(
         self,

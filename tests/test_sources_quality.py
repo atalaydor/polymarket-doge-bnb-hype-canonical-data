@@ -70,6 +70,14 @@ class InventoryAndAcquisitionTests(unittest.TestCase):
             self.assertEqual(first.markets, second.markets)
             self.assertEqual(first.provenance[0].sha256, second.provenance[0].sha256)
 
+    def test_official_missing_slot_is_evidence_backed_source_gap(self) -> None:
+        result = ProductionSourceLoader(
+            GammaClient(lambda _url, _limit: b"[]"), 7
+        ).discover(Asset.DOGE, [START_NS // 1_000_000_000], allow_missing=True)
+        self.assertEqual(result.markets, ())
+        self.assertEqual(result.exclusions[0].reason_code, ExclusionReason.SOURCE_GAP)
+        self.assertEqual(len(result.provenance), 1)
+
     def test_seekable_range_reader_ledgers_and_enforces_cap(self) -> None:
         payload = b"0123456789"
         reader = BoundedRangeReader(

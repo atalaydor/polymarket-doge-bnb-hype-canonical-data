@@ -207,7 +207,7 @@ def prepare_shared_day(
         loader = ProductionSourceLoader(
             GammaClient(), time.time_ns(), work_root / f"{asset.value}-{day}" / "official"
         )
-        discoveries[asset] = (loader, loader.discover(asset, starts))
+        discoveries[asset] = (loader, loader.discover(asset, starts, allow_missing=True))
     day_start_s = int(datetime(day.year, day.month, day.day, tzinfo=UTC).timestamp())
     day_start_ns = day_start_s * 1_000_000_000
     day_end_ns = min(
@@ -367,7 +367,7 @@ def run_partition(
     starts = expected_5m_market_starts(day, RELEASE_CUTOFF)
     work = work_root / f"{asset.value}-{day.isoformat()}"
     loader = ProductionSourceLoader(GammaClient(), time.time_ns(), work / "official")
-    discovered = loader.discover(asset, starts)
+    discovered = loader.discover(asset, starts, allow_missing=True)
     spool_path = shared_spool or work / "pmxt-events.sqlite"
     pmxt_provenance: list[Provenance] = list(shared_provenance)
     pmxt_events = 0
@@ -428,6 +428,7 @@ def run_partition(
         ),
         temporary_raw_paths=(acquired.path,) if shared_spool else (acquired.path, spool_path),
         event_spool_path=spool_path,
+        preexisting_exclusions=discovered.exclusions,
     )
     pipeline = Pipeline(work / "output", StateStore(work / "state"), _tool_commit())
     built = pipeline.build(inputs, day_end_ns)

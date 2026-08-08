@@ -60,6 +60,7 @@ class PartitionInputs:
     temporary_raw_paths: tuple[Path, ...] = ()
     decoded_pmxt_events: tuple[BookEvent, ...] = ()
     event_spool_path: Path | None = None
+    preexisting_exclusions: tuple[Exclusion, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -130,7 +131,7 @@ class Pipeline:
         self._advance_if_needed(partition_id, Phase.INVENTORIED, identity_digest)
         events: list[BookEvent] = []
         samples = []
-        exclusions: list[Exclusion] = []
+        exclusions: list[Exclusion] = list(inputs.preexisting_exclusions)
         accepted_markets: list[Market] = []
         partition_tiers: list[QualityTier] = []
         modes = sum(

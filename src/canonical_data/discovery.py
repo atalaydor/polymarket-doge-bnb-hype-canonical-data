@@ -46,11 +46,15 @@ class GammaClient:
         self.fetch = fetch
         self.max_payload_bytes = max_payload_bytes
 
-    def fetch_market(self, asset: Asset, market_start_s: int) -> tuple[Market, bytes, str]:
+    def fetch_slug_payload(self, asset: Asset, market_start_s: int) -> tuple[bytes, str]:
         slug = f"{asset.value.lower()}-updown-5m-{market_start_s}"
         query = urllib.parse.urlencode({"slug": slug})
         url = f"https://gamma-api.polymarket.com/events?{query}"
         payload = self.fetch(url, self.max_payload_bytes)
+        return payload, url
+
+    def fetch_market(self, asset: Asset, market_start_s: int) -> tuple[Market, bytes, str]:
+        payload, url = self.fetch_slug_payload(asset, market_start_s)
         markets = discover([payload])
         if len(markets) != 1:
             raise IdentityError("Gamma slug lookup did not return exactly one official market")

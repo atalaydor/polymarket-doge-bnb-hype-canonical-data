@@ -188,6 +188,9 @@ class PipelineTests(unittest.TestCase):
                         (market(),),
                         event_spool_path=spool_path,
                         provenance=(provenance(),),
+                        preexisting_exclusions=(
+                            Exclusion("missing-slug", ExclusionReason.SOURCE_GAP, "official gap"),
+                        ),
                     ),
                     market().market_end_ns,
                 )
@@ -195,6 +198,9 @@ class PipelineTests(unittest.TestCase):
                 files.append((built.directory / "book-events.parquet").read_bytes())
                 self.assertGreater(
                     pq.read_metadata(built.directory / "book-200ms.parquet").num_rows, 0
+                )
+                self.assertEqual(
+                    pq.read_metadata(built.directory / "exclusions.parquet").num_rows, 1
                 )
             self.assertEqual(digests[0], digests[1])
             self.assertEqual(files[0], files[1])
