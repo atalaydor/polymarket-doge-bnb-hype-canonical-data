@@ -26,7 +26,7 @@ from canonical_data.errors import ResourceLimitError, SourceError
 from canonical_data.httpclient import USER_AGENT
 from canonical_data.inventory import SourceObject, expected_5m_market_starts, pmxt_hourly_objects
 from canonical_data.manifest import hash_file
-from canonical_data.models import Asset, Market, Provenance
+from canonical_data.models import Asset, BookEvent, Market, Provenance
 from canonical_data.pipeline import PartitionInputs, Pipeline, PipelineLimits
 from canonical_data.release import GitHubReleaseBackend, Publisher
 from canonical_data.sources import ProductionSourceLoader
@@ -49,6 +49,27 @@ KACHO_FILES = {
         "0b0c15aada2423874c71f4bc9020ecc0edd849f0110152226efeadc3db43ebc9.source",
     ),
 }
+
+PMXT_FILTERED_ROWS_PER_ASSET_OBJECT = 500_000
+
+
+def enforce_shared_pmxt_asset_caps(
+    events: tuple[BookEvent, ...], markets_by_asset: dict[Asset, tuple[Market, ...]]
+) -> None:
+    """Preserve the frozen per-partition cap during one shared physical read."""
+    owner = {
+        market.condition_id: asset
+        for asset, markets in markets_by_asset.items()
+        for market in markets
+    }
+    counts = {asset: 0 for asset in markets_by_asset}
+    for event in events:
+        asset = owner.get(event.condition_id)
+        if asset is None:
+            raise SourceError("shared PMXT event is outside the bound market inventory")
+        counts[asset] += 1
+        if counts[asset] > PMXT_FILTERED_ROWS_PER_ASSET_OBJECT:
+            raise ResourceLimitError("PMXT filtered output exceeds per-asset row cap")
 
 
 def _atomic_json(path: Path, value: Any) -> None:
@@ -221,18 +242,22 @@ def prepare_shared_day(
             if source.url in state["completed_urls"]:
                 continue
             acquired = _acquire_with_retry(source, shared / "raw")
+            markets_by_asset = {
+                asset: discoveries[asset][1].markets for asset in Asset
+            }
             combined_markets = tuple(
-                market
-                for asset in Asset
-                for market in discoveries[asset][1].markets
+                market for markets in markets_by_asset.values() for market in markets
             )
             loaded = discoveries[Asset.DOGE][0].load_downloaded_pmxt(
                 acquired.path,
                 source.url,
                 combined_markets,
                 acquired.etag,
-                max_filtered_rows=500_000,
+                max_filtered_rows=(
+                    PMXT_FILTERED_ROWS_PER_ASSET_OBJECT * len(markets_by_asset)
+                ),
             )
+            enforce_shared_pmxt_asset_caps(loaded.events, markets_by_asset)
             spool.append(loaded.events)
             by_asset = {
                 asset.value: asdict(loaded.provenance[0]) for asset in Asset

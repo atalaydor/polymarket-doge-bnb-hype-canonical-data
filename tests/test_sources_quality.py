@@ -8,6 +8,7 @@ import zipfile
 from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
+from unittest import mock
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -24,15 +25,53 @@ from canonical_data.inventory import (
     pmxt_hourly_objects,
 )
 from canonical_data.kacho import ingest_kacho_ticks, kacho_native_events, read_kacho_parquet
-from canonical_data.models import Asset, ExclusionReason, Outcome, QualityTier
+from canonical_data.models import (
+    Asset,
+    BookEvent,
+    EventType,
+    ExclusionReason,
+    Outcome,
+    QualityTier,
+)
 from canonical_data.planner import build_backfill_plan
 from canonical_data.quality import RELEASE_START, classify
 from canonical_data.rangeio import BoundedRangeReader
 from canonical_data.resample import resample_200ms
 from canonical_data.sources import ProductionSourceLoader
+from scripts.run_backfill import enforce_shared_pmxt_asset_caps
 
 
 class InventoryAndAcquisitionTests(unittest.TestCase):
+    def test_shared_pmxt_cap_is_enforced_per_asset_not_combined_read(self) -> None:
+        doge = market(Asset.DOGE)
+        bnb = replace(market(Asset.BNB), condition_id="0x" + "b" * 64)
+
+        def event(condition_id: str, source_row: int) -> BookEvent:
+            return BookEvent(
+                condition_id=condition_id,
+                token_id="1",
+                source_ts_ns=START_NS,
+                receive_ts_ns=START_NS,
+                source_object="fixture",
+                source_row=source_row,
+                sequence=0,
+                event_type=EventType.PRICE_CHANGE,
+            )
+
+        inventories = {Asset.DOGE: (doge,), Asset.BNB: (bnb,)}
+        accepted = (
+            event(doge.condition_id, 0),
+            event(doge.condition_id, 1),
+            event(bnb.condition_id, 2),
+            event(bnb.condition_id, 3),
+        )
+        with mock.patch("scripts.run_backfill.PMXT_FILTERED_ROWS_PER_ASSET_OBJECT", 2):
+            enforce_shared_pmxt_asset_caps(accepted, inventories)
+            with self.assertRaises(ResourceLimitError):
+                enforce_shared_pmxt_asset_caps(
+                    (*accepted, event(doge.condition_id, 4)), inventories
+                )
+
     def test_pmxt_era_inventory_does_not_depend_on_degraded_kacho_metadata(self) -> None:
         cutoff = datetime(2026, 8, 7, 15, tzinfo=UTC)
         self.assertEqual(len(expected_5m_market_starts(date(2026, 4, 15), cutoff)), 288)
