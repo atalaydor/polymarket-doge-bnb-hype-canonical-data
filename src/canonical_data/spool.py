@@ -13,16 +13,25 @@ from canonical_data.pmxt import order_and_deduplicate
 
 
 class EventSpool:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, create_index: bool = True):
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
         self.connection = sqlite3.connect(path)
         self.connection.execute(
             "CREATE TABLE IF NOT EXISTS events (condition_id TEXT NOT NULL, payload BLOB NOT NULL)"
         )
-        self.connection.execute(
-            "CREATE INDEX IF NOT EXISTS events_condition ON events(condition_id)"
-        )
+        if create_index:
+            self.ensure_index()
+
+    def ensure_index(self) -> None:
+        with self.connection:
+            self.connection.execute(
+                "CREATE INDEX IF NOT EXISTS events_condition ON events(condition_id)"
+            )
+
+    def drop_index(self) -> None:
+        with self.connection:
+            self.connection.execute("DROP INDEX IF EXISTS events_condition")
 
     def append(self, events: Iterable[BookEvent]) -> int:
         count = 0

@@ -228,7 +228,8 @@ def prepare_shared_day(
         int(RELEASE_CUTOFF.timestamp()) * 1_000_000_000,
     )
     inventory_start_ns = max(day_start_ns - 3_600_000_000_000, 1_776_106_800_000_000_000)
-    with EventSpool(shared / "events.sqlite") as spool:
+    with EventSpool(shared / "events.sqlite", create_index=False) as spool:
+        spool.drop_index()
         for source in pmxt_hourly_objects(inventory_start_ns, day_end_ns):
             if source.url in state["completed_urls"]:
                 continue
@@ -253,6 +254,7 @@ def prepare_shared_day(
             state["source_bytes"] = int(state["source_bytes"]) + acquired.byte_length
             _atomic_json(state_path, state)
             acquired.path.unlink(missing_ok=True)
+        spool.ensure_index()
     provenance = {
         asset: tuple(
             _provenance_from_json(item[asset.value])
