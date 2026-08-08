@@ -20,10 +20,10 @@ class SourceObject:
 def pmxt_hourly_objects(start_ns: int, end_ns: int) -> list[SourceObject]:
     if end_ns <= start_ns:
         raise SourceError("inventory range must be positive")
-    start = datetime.fromtimestamp(start_ns / 1_000_000_000, UTC).replace(
+    start = datetime.fromtimestamp(start_ns // 1_000_000_000, UTC).replace(
         minute=0, second=0, microsecond=0
     )
-    end = datetime.fromtimestamp((end_ns - 1) / 1_000_000_000, UTC).replace(
+    end = datetime.fromtimestamp((end_ns - 1) // 1_000_000_000, UTC).replace(
         minute=0, second=0, microsecond=0
     )
     current = start

@@ -199,6 +199,29 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(digests[0], digests[1])
             self.assertEqual(files[0], files[1])
 
+    def test_disk_spool_enforces_native_event_cap_after_deduplication(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            spool_path = root / "events.sqlite"
+            with EventSpool(spool_path) as spool:
+                spool.append(decode_rows(pmxt_rows(), "fixture"))
+            with self.assertRaises(ResourceLimitError):
+                Pipeline(
+                    root / "out",
+                    StateStore(root / "state"),
+                    COMMIT,
+                    PipelineLimits(max_pmxt_rows=1),
+                ).build(
+                    PartitionInputs(
+                        Asset.DOGE,
+                        "2026-04-13",
+                        (market(),),
+                        event_spool_path=spool_path,
+                        provenance=(provenance(),),
+                    ),
+                    market().market_end_ns,
+                )
+
     def test_invalid_kacho_market_is_evidence_backed_exclusion_not_partition_abort(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

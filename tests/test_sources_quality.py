@@ -76,6 +76,8 @@ class InventoryAndAcquisitionTests(unittest.TestCase):
         items = pmxt_hourly_objects(START_NS, START_NS + 3_600_000_000_001)
         self.assertEqual(len(items), 2)
         self.assertTrue(items[0].url.endswith("2026-04-13T19.parquet"))
+        exact_hour = pmxt_hourly_objects(START_NS, START_NS + 3_600_000_000_000)
+        self.assertEqual(len(exact_hour), 1)
         hype = binance_daily_objects(Asset.HYPE, "2026-04-13", ("trades", "markPriceKlines"))
         self.assertTrue(all("futures/um" in item.url for item in hype))
         doge = binance_daily_objects(Asset.DOGE, "2026-04-13", ("klines",))

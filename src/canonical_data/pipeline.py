@@ -229,6 +229,8 @@ class Pipeline:
             else:
                 native_events = kacho_native_events(states)
             event_count += len(native_events)
+            if event_count > self.limits.max_pmxt_rows:
+                raise ResourceLimitError("native events exceed partition cap")
             if event_writer is not None and sample_writer is not None:
                 event_writer.append([event_row(item) for item in native_events])
                 sample_writer.append([sample_row(item) for item in native_samples])
