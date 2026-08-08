@@ -6,7 +6,7 @@ import tempfile
 import unittest
 import zipfile
 from dataclasses import replace
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pyarrow as pa
@@ -17,7 +17,12 @@ from canonical_data.acquire import BoundedAcquirer, copy_bounded
 from canonical_data.binance import ingest_binance_zip
 from canonical_data.discovery import GammaClient
 from canonical_data.errors import ResourceLimitError, SourceError
-from canonical_data.inventory import SourceObject, binance_daily_objects, pmxt_hourly_objects
+from canonical_data.inventory import (
+    SourceObject,
+    binance_daily_objects,
+    expected_5m_market_starts,
+    pmxt_hourly_objects,
+)
 from canonical_data.kacho import ingest_kacho_ticks, kacho_native_events, read_kacho_parquet
 from canonical_data.models import Asset, ExclusionReason, Outcome, QualityTier
 from canonical_data.planner import build_backfill_plan
@@ -28,6 +33,11 @@ from canonical_data.sources import ProductionSourceLoader
 
 
 class InventoryAndAcquisitionTests(unittest.TestCase):
+    def test_pmxt_era_inventory_does_not_depend_on_degraded_kacho_metadata(self) -> None:
+        cutoff = datetime(2026, 8, 7, 15, tzinfo=UTC)
+        self.assertEqual(len(expected_5m_market_starts(date(2026, 4, 15), cutoff)), 288)
+        self.assertEqual(len(expected_5m_market_starts(date(2026, 8, 7), cutoff)), 180)
+
     def test_finite_backfill_plan_is_ordered_and_month_grouped(self) -> None:
         plan = build_backfill_plan(date(2026, 4, 5), date(2026, 8, 7))
         self.assertEqual(len(plan), 375)

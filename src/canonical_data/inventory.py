@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 from canonical_data.errors import SourceError
 from canonical_data.models import Asset
@@ -15,6 +15,18 @@ class SourceObject:
     url: str
     expected_sha256: str | None = None
     expected_bytes: int | None = None
+
+
+def expected_5m_market_starts(day: date, cutoff: datetime) -> list[int]:
+    if cutoff.tzinfo is None:
+        raise SourceError("release cutoff must be timezone-aware")
+    midnight = int(datetime(day.year, day.month, day.day, tzinfo=UTC).timestamp())
+    cutoff_s = int(cutoff.timestamp())
+    return [
+        midnight + offset
+        for offset in range(0, 86_400, 300)
+        if midnight + offset < cutoff_s
+    ]
 
 
 def pmxt_hourly_objects(start_ns: int, end_ns: int) -> list[SourceObject]:

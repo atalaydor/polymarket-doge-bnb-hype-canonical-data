@@ -24,7 +24,7 @@ from canonical_data.binance import ingest_binance_zip
 from canonical_data.discovery import GammaClient
 from canonical_data.errors import ResourceLimitError, SourceError
 from canonical_data.httpclient import USER_AGENT
-from canonical_data.inventory import SourceObject, pmxt_hourly_objects
+from canonical_data.inventory import SourceObject, expected_5m_market_starts, pmxt_hourly_objects
 from canonical_data.manifest import hash_file
 from canonical_data.models import Asset, Market, Provenance
 from canonical_data.pipeline import PartitionInputs, Pipeline, PipelineLimits
@@ -109,16 +109,6 @@ def _market_starts(metadata: Path, day: date) -> list[int]:
         filters=[("market_start", ">=", start), ("market_start", "<", end)],
     )
     return sorted(int(value.timestamp()) for value in table["market_start"].to_pylist())
-
-
-def _expected_market_starts(day: date) -> list[int]:
-    midnight = int(datetime(day.year, day.month, day.day, tzinfo=UTC).timestamp())
-    cutoff = int(RELEASE_CUTOFF.timestamp())
-    return [
-        midnight + offset
-        for offset in range(0, 86_400, 300)
-        if midnight + offset < cutoff
-    ]
 
 
 def _retry_pmxt(
@@ -213,10 +203,7 @@ def prepare_shared_day(
     )
     discoveries: dict[Asset, Any] = {}
     for asset in Asset:
-        metadata_name, _ = KACHO_FILES[asset]
-        starts = _market_starts(kacho_root / metadata_name, day)
-        if not starts:
-            starts = _expected_market_starts(day)
+        starts = expected_5m_market_starts(day, RELEASE_CUTOFF)
         loader = ProductionSourceLoader(
             GammaClient(), time.time_ns(), work_root / f"{asset.value}-{day}" / "official"
         )
@@ -377,9 +364,7 @@ def run_partition(
     began = time.perf_counter()
     cpu_began = time.process_time()
     metadata_name, ticks_name = KACHO_FILES[asset]
-    starts = _market_starts(kacho_root / metadata_name, day)
-    if not starts:
-        starts = _expected_market_starts(day)
+    starts = expected_5m_market_starts(day, RELEASE_CUTOFF)
     work = work_root / f"{asset.value}-{day.isoformat()}"
     loader = ProductionSourceLoader(GammaClient(), time.time_ns(), work / "official")
     discovered = loader.discover(asset, starts)
