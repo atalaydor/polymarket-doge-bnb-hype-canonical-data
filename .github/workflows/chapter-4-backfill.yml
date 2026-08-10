@@ -62,7 +62,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
-      contents: read
+      # The authoritative partition inventory is held in draft dataset releases.
+      contents: write
     outputs:
       matrix_0: ${{ steps.plan.outputs.matrix_0 }}
       matrix_1: ${{ steps.plan.outputs.matrix_1 }}
