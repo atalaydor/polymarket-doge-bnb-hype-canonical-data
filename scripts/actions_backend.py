@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import urlsplit
 
 from canonical_data.audit import canonical_json_bytes
 from canonical_data.planner import build_backfill_plan
@@ -36,21 +37,25 @@ EXPECTED_FILES = {
 ASSET_PATTERN = re.compile(
     r"^(DOGE|BNB|HYPE)--5m--(\d{4}-\d{2}-\d{2})--([0-9a-f]{64})--(.+)$"
 )
+KACHO_REVISION = "f646aa62c6ffe3873fefb9f4a9b4ef7df0f5b4e5"
 KACHO_TICKS = {
     "DOGE": (
         "doge_ticks.parquet",
-        "99c1446c1f9f21f4822d34d10213afe82225ade6ec878d058585f8e4d15e8a92.source",
-        "99c1446c1f9f21f4822d34d10213afe82225ade6ec878d058585f8e4d15e8a92",
+        "7fabd65d9af567ca39ac520f4e7ee749d059f8574aa3f53ea5d3db37a3707cee.source",
+        "7fabd65d9af567ca39ac520f4e7ee749d059f8574aa3f53ea5d3db37a3707cee",
+        80_060_676,
     ),
     "BNB": (
         "bnb_ticks.parquet",
-        "9c8b8613d42a7255a47cd5ea3bdf5e7d109e6aeda716000cb0016bd06a4d7d56.source",
-        "9c8b8613d42a7255a47cd5ea3bdf5e7d109e6aeda716000cb0016bd06a4d7d56",
+        "1958c9643a15add7620703329f47d3f67d8ff4c5c8d6115696bc745fb866478e.source",
+        "1958c9643a15add7620703329f47d3f67d8ff4c5c8d6115696bc745fb866478e",
+        76_690_643,
     ),
     "HYPE": (
         "hype_ticks.parquet",
-        "0b0c15aada2423874c71f4bc9020ecc0edd849f0110152226efeadc3db43ebc9.source",
-        "0b0c15aada2423874c71f4bc9020ecc0edd849f0110152226efeadc3db43ebc9",
+        "f99e833ba91bde2406d288b3419d502db396282749e5c07125c01ee4ebbe3dd6.source",
+        "f99e833ba91bde2406d288b3419d502db396282749e5c07125c01ee4ebbe3dd6",
+        74_977_804,
     ),
 }
 
@@ -194,19 +199,42 @@ def _sha256(path: Path) -> str:
 
 
 def acquire_kacho(asset: str, root: Path) -> int:
-    source_name, target_name, expected = KACHO_TICKS[asset]
+    source_name, target_name, expected_digest, expected_bytes = KACHO_TICKS[asset]
     root.mkdir(parents=True, exist_ok=True)
     target = root / target_name
     url = (
         "https://huggingface.co/datasets/kachoio/"
-        f"polymarket-5-minute-crypto-up-down-markets/resolve/main/{source_name}"
+        "polymarket-5-minute-crypto-up-down-markets/resolve/"
+        f"{KACHO_REVISION}/{source_name}"
     )
     request = urllib.request.Request(url, headers={"User-Agent": "chapter-4-actions-backend/1.0"})
     with urllib.request.urlopen(request, timeout=300) as response, target.open("wb") as handle:
         shutil.copyfileobj(response, handle, 1_048_576)
-    if _sha256(target) != expected:
-        raise RuntimeError("Kacho source digest mismatch")
-    return target.stat().st_size
+        status = int(response.status)
+        content_type = response.headers.get_content_type()
+        content_length = response.headers.get("Content-Length")
+        etag = response.headers.get("ETag")
+        response_host = urlsplit(response.geturl()).hostname
+    actual_bytes = target.stat().st_size
+    actual_digest = _sha256(target)
+    if actual_bytes != expected_bytes or actual_digest != expected_digest:
+        diagnostics = {
+            "source": source_name,
+            "revision": KACHO_REVISION,
+            "status": status,
+            "response_host": response_host,
+            "content_type": content_type,
+            "content_length": content_length,
+            "etag": etag,
+            "expected_bytes": expected_bytes,
+            "actual_bytes": actual_bytes,
+            "expected_sha256": expected_digest,
+            "actual_sha256": actual_digest,
+        }
+        raise RuntimeError(
+            f"Kacho source integrity mismatch: {json.dumps(diagnostics, sort_keys=True)}"
+        )
+    return actual_bytes
 
 
 def _atomic_json(path: Path, value: Any) -> None:

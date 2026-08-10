@@ -39,15 +39,15 @@ RELEASE_CUTOFF = datetime(2026, 8, 7, 15, tzinfo=UTC)
 KACHO_FILES = {
     Asset.DOGE: (
         "ab8ddc3e1a143d5786b6817c04a2732e5be45da77b137e52275c3877fb5f00ef.source",
-        "99c1446c1f9f21f4822d34d10213afe82225ade6ec878d058585f8e4d15e8a92.source",
+        "7fabd65d9af567ca39ac520f4e7ee749d059f8574aa3f53ea5d3db37a3707cee.source",
     ),
     Asset.BNB: (
         "85744b85e942f6d7348b5d9a87602fd523c2e42e33febeb519d5c2878d5c1efe.source",
-        "9c8b8613d42a7255a47cd5ea3bdf5e7d109e6aeda716000cb0016bd06a4d7d56.source",
+        "1958c9643a15add7620703329f47d3f67d8ff4c5c8d6115696bc745fb866478e.source",
     ),
     Asset.HYPE: (
         "acfc39a2315f1340f41aec70b5e17e4a6275ad4614ffdf62cbfe3b23b035e022.source",
-        "0b0c15aada2423874c71f4bc9020ecc0edd849f0110152226efeadc3db43ebc9.source",
+        "f99e833ba91bde2406d288b3419d502db396282749e5c07125c01ee4ebbe3dd6.source",
     ),
 }
 

@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import hashlib
 import unittest
+from email.message import Message
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from scripts.actions_backend import (
+    KACHO_REVISION,
+    KACHO_TICKS,
     RemoteAsset,
+    acquire_kacho,
     matrix_stages,
     select_proof_partition,
     unfinished_plan,
@@ -11,7 +19,68 @@ from scripts.actions_backend import (
 )
 
 
+class FakeResponse:
+    def __init__(self, payload: bytes) -> None:
+        self.payload = payload
+        self.offset = 0
+        self.status = 200
+        self.headers = Message()
+        self.headers["Content-Type"] = "application/octet-stream"
+        self.headers["Content-Length"] = str(len(payload))
+        self.headers["ETag"] = '"object-etag"'
+
+    def __enter__(self) -> FakeResponse:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def read(self, size: int = -1) -> bytes:
+        if size < 0:
+            size = len(self.payload) - self.offset
+        chunk = self.payload[self.offset : self.offset + size]
+        self.offset += len(chunk)
+        return chunk
+
+    def geturl(self) -> str:
+        return "https://cdn-lfs.example.test/object?credential=secret"
+
+
 class ActionsBackendTests(unittest.TestCase):
+    def test_kacho_accepts_only_pinned_object_at_immutable_revision(self) -> None:
+        payload = b"pinned-parquet-object"
+        digest = hashlib.sha256(payload).hexdigest()
+        response = FakeResponse(payload)
+        with TemporaryDirectory() as temporary:
+            with (
+                patch.dict(
+                    KACHO_TICKS,
+                    {"DOGE": ("doge_ticks.parquet", f"{digest}.source", digest, len(payload))},
+                ),
+                patch(
+                    "scripts.actions_backend.urllib.request.urlopen", return_value=response
+                ) as urlopen,
+            ):
+                self.assertEqual(acquire_kacho("DOGE", Path(temporary)), len(payload))
+                requested = str(urlopen.call_args.args[0].full_url)
+                self.assertIn(f"/resolve/{KACHO_REVISION}/doge_ticks.parquet", requested)
+                self.assertEqual((Path(temporary) / f"{digest}.source").read_bytes(), payload)
+
+    def test_kacho_rejects_wrong_object_with_bounded_safe_diagnostics(self) -> None:
+        with TemporaryDirectory() as temporary:
+            with patch(
+                "scripts.actions_backend.urllib.request.urlopen",
+                return_value=FakeResponse(b"not-the-pinned-parquet"),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    r'"actual_bytes": 22.*"actual_sha256":.*'
+                    r'"response_host": "cdn-lfs.example.test"',
+                ) as raised:
+                    acquire_kacho("DOGE", Path(temporary))
+        self.assertNotIn("credential", str(raised.exception))
+        self.assertNotIn("not-the-pinned-parquet", str(raised.exception))
+
     @staticmethod
     def _assets(partition: str) -> list[RemoteAsset]:
         asset, _, day = partition.split("/")
