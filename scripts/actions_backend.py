@@ -121,6 +121,21 @@ def verified_partitions(inventory: dict[str, list[RemoteAsset]]) -> set[str]:
     return verified
 
 
+def select_proof_partition(
+    ledger: dict[str, Any], inventory: dict[str, list[RemoteAsset]]
+) -> str:
+    plan = build_backfill_plan(PLAN_START, PLAN_END)
+    completed = int(ledger["completed"])
+    if completed < 1 or completed > len(plan):
+        raise RuntimeError("ledger completed count is outside the finite plan")
+    expected = str(plan[completed - 1]["partition_id"])
+    if ledger.get("last_partition") != expected:
+        raise RuntimeError("ledger completion frontier is inconsistent with the finite plan")
+    if expected not in verified_partitions(inventory):
+        raise RuntimeError(f"ledger proof partition lacks durable remote evidence: {expected}")
+    return expected
+
+
 def unfinished_plan(inventory: dict[str, list[RemoteAsset]]) -> list[dict[str, Any]]:
     complete = verified_partitions(inventory)
     return [
@@ -260,9 +275,12 @@ def command_plan() -> None:
     _write_output("unfinished", str(len(plan)))
 
 
-def command_proof(partition: str) -> None:
+def command_proof() -> None:
     began = time.monotonic()
-    report = verify_remote_partition(partition, remote_inventory())
+    inventory = remote_inventory()
+    ledger = json.loads(Path("config/backfill-ledger.json").read_bytes())
+    partition = select_proof_partition(ledger, inventory)
+    report = verify_remote_partition(partition, inventory)
     report["wall_seconds"] = time.monotonic() - began
     print(json.dumps(report, sort_keys=True))
 
@@ -344,15 +362,14 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("plan")
-    proof = commands.add_parser("proof")
-    proof.add_argument("--partition", required=True)
+    commands.add_parser("proof")
     execute = commands.add_parser("execute")
     execute.add_argument("--partition")
     args = parser.parse_args()
     if args.command == "plan":
         command_plan()
     elif args.command == "proof":
-        command_proof(args.partition)
+        command_proof()
     else:
         command_execute(args.partition)
 
