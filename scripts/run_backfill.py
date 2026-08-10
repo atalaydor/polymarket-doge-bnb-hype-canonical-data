@@ -11,6 +11,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Mapping
 from dataclasses import asdict
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -54,7 +55,7 @@ PMXT_FILTERED_ROWS_PER_ASSET_OBJECT = 500_000
 
 
 def enforce_shared_pmxt_asset_caps(
-    events: tuple[BookEvent, ...], markets_by_asset: dict[Asset, tuple[Market, ...]]
+    events: tuple[BookEvent, ...], markets_by_asset: Mapping[Asset, tuple[Market, ...]]
 ) -> None:
     """Preserve the frozen per-partition cap during one shared physical read."""
     owner = {
@@ -495,6 +496,7 @@ def main() -> None:
     parser.add_argument("--ledger", type=Path, required=True)
     parser.add_argument("--start", type=date.fromisoformat, default=date(2026, 4, 5))
     parser.add_argument("--end", type=date.fromisoformat, default=date(2026, 4, 12))
+    parser.add_argument("--asset", choices=[asset.value for asset in Asset])
     args = parser.parse_args()
     current = args.start
     while current <= args.end:
@@ -505,7 +507,8 @@ def main() -> None:
             shared_spool, shared_provenance, shared_source_bytes = prepare_shared_day(
                 current, args.kacho_root, args.work_root
             )
-        for asset in Asset:
+        selected_assets = tuple(Asset) if args.asset is None else (Asset(args.asset),)
+        for asset in selected_assets:
             print(
                 json.dumps(
                     run_partition(
