@@ -9,9 +9,11 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import date
@@ -58,6 +60,8 @@ KACHO_TICKS = {
         74_977_804,
     ),
 }
+TRANSIENT_HTTP_STATUS = {408, 429, 500, 502, 503, 504}
+TRANSFER_RETRY_DELAYS = (2, 8, 32)
 
 
 @dataclass(frozen=True)
@@ -198,6 +202,18 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def kacho_required(day: str) -> bool:
+    return date.fromisoformat(day) <= date(2026, 5, 18)
+
+
+def _raise_child_failure(completed: subprocess.CompletedProcess[str]) -> None:
+    if not completed.returncode:
+        return
+    sys.stdout.write(completed.stdout)
+    sys.stderr.write(completed.stderr)
+    raise RuntimeError(f"one-partition executor failed with exit code {completed.returncode}")
+
+
 def acquire_kacho(asset: str, root: Path) -> int:
     source_name, target_name, expected_digest, expected_bytes = KACHO_TICKS[asset]
     root.mkdir(parents=True, exist_ok=True)
@@ -208,13 +224,32 @@ def acquire_kacho(asset: str, root: Path) -> int:
         f"{KACHO_REVISION}/{source_name}"
     )
     request = urllib.request.Request(url, headers={"User-Agent": "chapter-4-actions-backend/1.0"})
-    with urllib.request.urlopen(request, timeout=300) as response, target.open("wb") as handle:
-        shutil.copyfileobj(response, handle, 1_048_576)
-        status = int(response.status)
-        content_type = response.headers.get_content_type()
-        content_length = response.headers.get("Content-Length")
-        etag = response.headers.get("ETag")
-        response_host = urlsplit(response.geturl()).hostname
+    last_error: Exception | None = None
+    for attempt, delay in enumerate((0, *TRANSFER_RETRY_DELAYS)):
+        if delay:
+            time.sleep(delay)
+        try:
+            with urllib.request.urlopen(request, timeout=300) as response, target.open(
+                "wb"
+            ) as handle:
+                shutil.copyfileobj(response, handle, 1_048_576)
+                status = int(response.status)
+                content_type = response.headers.get_content_type()
+                content_length = response.headers.get("Content-Length")
+                etag = response.headers.get("ETag")
+                response_host = urlsplit(response.geturl()).hostname
+            break
+        except urllib.error.HTTPError as exc:
+            target.unlink(missing_ok=True)
+            if exc.code not in TRANSIENT_HTTP_STATUS:
+                raise
+            last_error = exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            target.unlink(missing_ok=True)
+            last_error = exc
+        if attempt == len(TRANSFER_RETRY_DELAYS):
+            assert last_error is not None
+            raise last_error
     actual_bytes = target.stat().st_size
     actual_digest = _sha256(target)
     if actual_bytes != expected_bytes or actual_digest != expected_digest:
@@ -333,7 +368,7 @@ def command_execute(requested: str | None) -> None:
         raise RuntimeError("unsupported timeframe")
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
-        kacho_bytes = acquire_kacho(asset, root / "kacho")
+        kacho_bytes = acquire_kacho(asset, root / "kacho") if kacho_required(day) else 0
         detailed = root / "partition-ledger.json"
         command = [
             "python",
@@ -366,11 +401,12 @@ def command_execute(requested: str | None) -> None:
         sampler.start()
         began = time.monotonic()
         try:
-            completed = subprocess.run(command, check=True, text=True, capture_output=True)
+            completed = subprocess.run(command, check=False, text=True, capture_output=True)
         finally:
             stopped.set()
             sampler.join()
         wall = time.monotonic() - began
+        _raise_child_failure(completed)
         lines = [line for line in completed.stdout.splitlines() if line.startswith("{")]
         if len(lines) != 1:
             raise RuntimeError("one-partition executor did not return exactly one result")

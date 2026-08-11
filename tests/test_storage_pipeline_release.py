@@ -164,6 +164,47 @@ class StateTests(unittest.TestCase):
 
 
 class PipelineTests(unittest.TestCase):
+    def test_empty_partition_without_exclusion_evidence_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with self.assertRaisesRegex(
+                PipelineError, "lacks explicit exclusion evidence"
+            ):
+                Pipeline(root / "out", StateStore(root / "state"), COMMIT).build(
+                    PartitionInputs(
+                        Asset.DOGE,
+                        "2026-04-13",
+                        (),
+                        provenance=(provenance(),),
+                    ),
+                    market().market_end_ns,
+                )
+
+    def test_all_market_source_gaps_build_an_explicit_excluded_partition(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            item = market()
+            exclusion = Exclusion(
+                item.market_id, ExclusionReason.SOURCE_GAP, "no usable event evidence"
+            )
+            built = Pipeline(root / "out", StateStore(root / "state"), COMMIT).build(
+                PartitionInputs(
+                    Asset.DOGE,
+                    "2026-04-13",
+                    (),
+                    provenance=(provenance(),),
+                    preexisting_exclusions=(exclusion,),
+                ),
+                item.market_end_ns,
+            )
+            manifest = json.loads((built.directory / "manifest.json").read_bytes())
+            self.assertEqual(built.tier, QualityTier.EXCLUDED)
+            self.assertEqual(manifest["quality_tier"], "EXCLUDED")
+            self.assertEqual(manifest["statistics"]["market_count"], 0)
+            self.assertEqual(
+                pq.read_metadata(built.directory / "exclusions.parquet").num_rows, 1
+            )
+
     def test_disk_spool_pipeline_is_bounded_and_byte_deterministic(self) -> None:
         decoded = decode_rows(pmxt_rows(), "fixture")
         with tempfile.TemporaryDirectory() as temp:
@@ -458,15 +499,16 @@ class PipelineTests(unittest.TestCase):
                 self.assertEqual(built.checkpoint.phase, Phase.VERIFIED)
                 self.assertEqual(verify_manifest(built.directory), built.manifest_digest)
 
-    def test_no_publishable_market_refuses_canonical_output(self) -> None:
+    def test_no_publishable_market_is_canonical_excluded_output(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             pipeline = Pipeline(root / "out", StateStore(root / "state"), COMMIT)
             inputs = PartitionInputs(
                 Asset.DOGE, "2026-04-13", (market(),), provenance=(provenance(),)
             )
-            with self.assertRaises(PipelineError):
-                pipeline.build(inputs, market().market_end_ns)
+            built = pipeline.build(inputs, market().market_end_ns)
+            self.assertEqual(built.tier, QualityTier.EXCLUDED)
+            self.assertEqual(verify_manifest(built.directory), built.manifest_digest)
 
 
 class FailingOnceBackend(DirectoryReleaseBackend):

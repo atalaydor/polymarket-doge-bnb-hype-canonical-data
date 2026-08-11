@@ -239,8 +239,8 @@ class Pipeline:
                 events.extend(native_events)
                 samples.extend(native_samples)
         tier = self._partition_tier(partition_tiers)
-        if tier is QualityTier.EXCLUDED:
-            raise PipelineError("partition has no publishable markets")
+        if tier is QualityTier.EXCLUDED and not exclusions:
+            raise PipelineError("excluded partition lacks explicit exclusion evidence")
         if spool is None:
             counts = write_partition_tables(
                 directory, accepted_markets, events, samples, inputs.underlying, exclusions

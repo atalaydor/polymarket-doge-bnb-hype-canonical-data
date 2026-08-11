@@ -1,22 +1,33 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import json
+import subprocess
 import unittest
+import urllib.error
+from contextlib import redirect_stderr, redirect_stdout
+from datetime import date
 from email.message import Message
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from canonical_data.errors import SourceError
+from canonical_data.models import Asset, Exclusion, ExclusionReason, Provenance
 from scripts.actions_backend import (
     KACHO_REVISION,
     KACHO_TICKS,
     RemoteAsset,
+    _raise_child_failure,
     acquire_kacho,
+    kacho_required,
     matrix_stages,
     select_proof_partition,
     unfinished_plan,
     verified_partitions,
 )
+from scripts.run_backfill import _fetch_gamma, prepare_shared_day, run_partition
 
 
 class FakeResponse:
@@ -47,6 +58,149 @@ class FakeResponse:
 
 
 class ActionsBackendTests(unittest.TestCase):
+    def test_child_failure_surfaces_captured_diagnostics(self) -> None:
+        completed = subprocess.CompletedProcess(
+            ["executor"], 7, stdout="child-out\n", stderr="child-error\n"
+        )
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+            self.assertRaisesRegex(RuntimeError, "exit code 7"),
+        ):
+            _raise_child_failure(completed)
+        self.assertEqual(stdout.getvalue(), "child-out\n")
+        self.assertEqual(stderr.getvalue(), "child-error\n")
+
+    def test_gamma_retries_transient_status_and_preserves_payload_bound(self) -> None:
+        throttled = urllib.error.HTTPError(
+            "https://example.test/gamma", 429, "Too Many Requests", Message(), None
+        )
+        with (
+            patch(
+                "scripts.run_backfill.urllib.request.urlopen",
+                side_effect=(throttled, FakeResponse(b"[]")),
+            ) as urlopen,
+            patch("scripts.run_backfill.time.sleep") as sleep,
+        ):
+            self.assertEqual(_fetch_gamma("https://example.test/gamma", 2), b"[]")
+            self.assertEqual(urlopen.call_count, 2)
+            sleep.assert_called_once_with(2)
+        with patch(
+            "scripts.run_backfill.urllib.request.urlopen",
+            return_value=FakeResponse(b"oversized"),
+        ):
+            with self.assertRaisesRegex(SourceError, "configured bound"):
+                _fetch_gamma("https://example.test/gamma", 2)
+
+    def test_all_missing_official_inventory_skips_pmxt_acquisition(self) -> None:
+        class MissingLoader:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                pass
+
+            def discover(self, *args: object, **kwargs: object) -> object:
+                from types import SimpleNamespace
+
+                return SimpleNamespace(markets=(), provenance=(), exclusions=(object(),))
+
+        with TemporaryDirectory() as temporary:
+            with (
+                patch("scripts.run_backfill.ProductionSourceLoader", MissingLoader),
+                patch("scripts.run_backfill.pmxt_hourly_objects") as inventory,
+            ):
+                spool, provenance, source_bytes = prepare_shared_day(
+                    date(2026, 6, 1),
+                    Path(temporary) / "kacho",
+                    Path(temporary) / "work",
+                    (Asset.HYPE,),
+                )
+            inventory.assert_not_called()
+            self.assertTrue(spool.exists())
+            self.assertEqual(provenance, {Asset.HYPE: ()})
+            self.assertEqual(source_bytes, 0)
+
+    def test_all_missing_partition_skips_binance_and_writes_excluded_ledger(self) -> None:
+        official = Provenance(
+            "polymarket_gamma_clob",
+            "https://gamma-api.polymarket.com/events?slug=missing",
+            1,
+            2,
+            "a" * 64,
+            "ungranted_for_bulk_redistribution",
+            "official_api",
+        )
+        exclusion = Exclusion(
+            "hype-updown-5m-missing",
+            ExclusionReason.SOURCE_GAP,
+            "official Gamma slug returned no market",
+            {"payload_sha256": "b" * 64},
+        )
+
+        class MissingLoader:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                pass
+
+            def discover(self, *args: object, **kwargs: object) -> object:
+                from types import SimpleNamespace
+
+                return SimpleNamespace(
+                    markets=(), provenance=(official,), exclusions=(exclusion,)
+                )
+
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ledger = root / "ledger.json"
+            with (
+                patch("scripts.run_backfill.ProductionSourceLoader", MissingLoader),
+                patch("scripts.run_backfill._fetch_text") as fetch_binance,
+                patch("scripts.run_backfill._tool_commit", return_value="d" * 40),
+                patch("scripts.run_backfill.Pipeline.publish", return_value=[object()] * 6),
+            ):
+                result = run_partition(
+                    Asset.HYPE,
+                    date(2026, 6, 1),
+                    root / "kacho",
+                    root / "work",
+                    ledger,
+                )
+            fetch_binance.assert_not_called()
+            self.assertEqual(result["quality"], "EXCLUDED")
+            self.assertEqual(result["source_bytes"], 0)
+            self.assertEqual(result["remote_assets"], 6)
+            stored = json.loads(ledger.read_bytes())
+            self.assertEqual(stored["partitions"]["HYPE/5m/2026-06-01"], result)
+
+    def test_kacho_transfer_is_limited_to_the_frozen_fallback_window(self) -> None:
+        self.assertTrue(kacho_required("2026-05-18"))
+        self.assertFalse(kacho_required("2026-05-19"))
+        self.assertFalse(kacho_required("2026-08-07"))
+
+    def test_kacho_retries_transient_throttle_without_retaining_partial_bytes(self) -> None:
+        payload = b"pinned-parquet-object"
+        digest = hashlib.sha256(payload).hexdigest()
+        throttled = urllib.error.HTTPError(
+            "https://example.test/object", 429, "Too Many Requests", Message(), None
+        )
+        with TemporaryDirectory() as temporary:
+            with (
+                patch.dict(
+                    KACHO_TICKS,
+                    {"DOGE": ("doge_ticks.parquet", f"{digest}.source", digest, len(payload))},
+                ),
+                patch(
+                    "scripts.actions_backend.urllib.request.urlopen",
+                    side_effect=(throttled, FakeResponse(payload)),
+                ) as urlopen,
+                patch("scripts.actions_backend.time.sleep") as sleep,
+            ):
+                self.assertEqual(acquire_kacho("DOGE", Path(temporary)), len(payload))
+                self.assertEqual(urlopen.call_count, 2)
+                sleep.assert_called_once_with(2)
+                self.assertEqual(
+                    (Path(temporary) / f"{digest}.source").read_bytes(), payload
+                )
+
     def test_kacho_accepts_only_pinned_object_at_immutable_revision(self) -> None:
         payload = b"pinned-parquet-object"
         digest = hashlib.sha256(payload).hexdigest()

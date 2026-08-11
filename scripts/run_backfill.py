@@ -35,6 +35,7 @@ from canonical_data.spool import EventSpool
 from canonical_data.state import StateStore
 
 RETRY_DELAYS = (2, 8, 32)
+TRANSIENT_HTTP_STATUS = {408, 429, 500, 502, 503, 504}
 RELEASE_CUTOFF = datetime(2026, 8, 7, 15, tzinfo=UTC)
 KACHO_FILES = {
     Asset.DOGE: (
@@ -104,6 +105,37 @@ def _fetch_text(url: str) -> str:
                 raise
             last = exc
         except urllib.error.URLError as exc:
+            last = exc
+        if attempt == len(RETRY_DELAYS):
+            break
+    assert last is not None
+    raise last
+
+
+def _fetch_gamma(url: str, max_bytes: int) -> bytes:
+    """Retry bounded official lookups without weakening identity validation."""
+    last: Exception | None = None
+    for attempt, delay in enumerate((0, *RETRY_DELAYS)):
+        if delay:
+            time.sleep(delay)
+        try:
+            request = urllib.request.Request(
+                url,
+                headers={"Accept": "application/json", "User-Agent": USER_AGENT},
+            )
+            with urllib.request.urlopen(request, timeout=30) as response:
+                length = response.headers.get("Content-Length")
+                if length is not None and int(length) > max_bytes:
+                    raise SourceError("Gamma payload exceeds configured bound")
+                payload = cast(bytes, response.read(max_bytes + 1))
+            if len(payload) > max_bytes:
+                raise SourceError("Gamma payload exceeds configured bound")
+            return payload
+        except urllib.error.HTTPError as exc:
+            if exc.code not in TRANSIENT_HTTP_STATUS:
+                raise
+            last = exc
+        except (urllib.error.URLError, TimeoutError) as exc:
             last = exc
         if attempt == len(RETRY_DELAYS):
             break
@@ -214,7 +246,7 @@ def _provenance_from_json(value: dict[str, Any]) -> Provenance:
 
 
 def prepare_shared_day(
-    day: date, kacho_root: Path, work_root: Path
+    day: date, kacho_root: Path, work_root: Path, assets: tuple[Asset, ...] = tuple(Asset)
 ) -> tuple[Path, dict[Asset, tuple[Provenance, ...]], int]:
     shared = work_root / f"shared-{day.isoformat()}"
     state_path = shared / "state.json"
@@ -224,12 +256,19 @@ def prepare_shared_day(
         else {"completed_urls": {}, "source_bytes": 0}
     )
     discoveries: dict[Asset, Any] = {}
-    for asset in Asset:
+    for asset in assets:
         starts = expected_5m_market_starts(day, RELEASE_CUTOFF)
         loader = ProductionSourceLoader(
-            GammaClient(), time.time_ns(), work_root / f"{asset.value}-{day}" / "official"
+            GammaClient(fetch=_fetch_gamma),
+            time.time_ns(),
+            work_root / f"{asset.value}-{day}" / "official",
         )
         discoveries[asset] = (loader, loader.discover(asset, starts, allow_missing=True))
+    if not any(discoveries[asset][1].markets for asset in assets):
+        spool_path = shared / "events.sqlite"
+        with EventSpool(spool_path):
+            pass
+        return spool_path, {asset: () for asset in assets}, 0
     day_start_s = int(datetime(day.year, day.month, day.day, tzinfo=UTC).timestamp())
     day_start_ns = day_start_s * 1_000_000_000
     day_end_ns = min(
@@ -243,13 +282,11 @@ def prepare_shared_day(
             if source.url in state["completed_urls"]:
                 continue
             acquired = _acquire_with_retry(source, shared / "raw")
-            markets_by_asset = {
-                asset: discoveries[asset][1].markets for asset in Asset
-            }
+            markets_by_asset = {asset: discoveries[asset][1].markets for asset in assets}
             combined_markets = tuple(
                 market for markets in markets_by_asset.values() for market in markets
             )
-            loaded = discoveries[Asset.DOGE][0].load_downloaded_pmxt(
+            loaded = discoveries[assets[0]][0].load_downloaded_pmxt(
                 acquired.path,
                 source.url,
                 combined_markets,
@@ -260,9 +297,7 @@ def prepare_shared_day(
             )
             enforce_shared_pmxt_asset_caps(loaded.events, markets_by_asset)
             spool.append(loaded.events)
-            by_asset = {
-                asset.value: asdict(loaded.provenance[0]) for asset in Asset
-            }
+            by_asset = {asset.value: asdict(loaded.provenance[0]) for asset in assets}
             state["completed_urls"][source.url] = by_asset
             state["source_bytes"] = int(state["source_bytes"]) + acquired.byte_length
             _atomic_json(state_path, state)
@@ -273,7 +308,7 @@ def prepare_shared_day(
             _provenance_from_json(item[asset.value])
             for _, item in sorted(state["completed_urls"].items())
         )
-        for asset in Asset
+        for asset in assets
     }
     return shared / "events.sqlite", provenance, int(state["source_bytes"])
 
@@ -303,7 +338,9 @@ def run_tier_b(
         _atomic_json(ledger_path, ledger)
         return result
     work = work_root / f"{asset.value}-{day.isoformat()}"
-    loader = ProductionSourceLoader(GammaClient(), time.time_ns(), work / "official")
+    loader = ProductionSourceLoader(
+        GammaClient(fetch=_fetch_gamma), time.time_ns(), work / "official"
+    )
     discovered = loader.discover(asset, starts)
     kacho_rows, kacho_provenance = loader.load_kacho(kacho_root / ticks_name, discovered.markets)
     symbol, binance_root, precision = _instrument(asset)
@@ -392,8 +429,51 @@ def run_partition(
     metadata_name, ticks_name = KACHO_FILES[asset]
     starts = expected_5m_market_starts(day, RELEASE_CUTOFF)
     work = work_root / f"{asset.value}-{day.isoformat()}"
-    loader = ProductionSourceLoader(GammaClient(), time.time_ns(), work / "official")
+    loader = ProductionSourceLoader(
+        GammaClient(fetch=_fetch_gamma), time.time_ns(), work / "official"
+    )
     discovered = loader.discover(asset, starts, allow_missing=True)
+    if not discovered.markets:
+        inputs = PartitionInputs(
+            asset,
+            day.isoformat(),
+            (),
+            provenance=discovered.provenance,
+            preexisting_exclusions=discovered.exclusions,
+        )
+        pipeline = Pipeline(work / "output", StateStore(work / "state"), _tool_commit())
+        partition_cutoff = min(
+            datetime(day.year, day.month, day.day, tzinfo=UTC) + timedelta(days=1),
+            RELEASE_CUTOFF,
+        )
+        built = pipeline.build(inputs, int(partition_cutoff.timestamp()) * 1_000_000_000)
+        release_tag = f"dataset-v1-{day:%Y-%m}"
+        assets = pipeline.publish(
+            built,
+            Publisher(GitHubReleaseBackend("atalaydor/polymarket-doge-bnb-hype-canonical-data")),
+            release_tag,
+            (),
+        )
+        result = {
+            "partition_id": partition_id,
+            "quality": built.tier.value,
+            "markets": 0,
+            "pmxt_events": 0,
+            "kacho_rows": 0,
+            "underlying_rows": 0,
+            "canonical_bytes": sum(path.stat().st_size for path in built.directory.iterdir()),
+            "manifest_sha256": built.manifest_digest,
+            "release_tag": release_tag,
+            "remote_assets": len(assets),
+            "source_bytes": 0,
+            "wall_seconds": time.perf_counter() - began,
+            "cpu_seconds": time.process_time() - cpu_began,
+            "peak_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+        }
+        ledger["partitions"][partition_id] = result
+        _atomic_json(ledger_path, ledger)
+        shutil.rmtree(work)
+        return result
     spool_path = shared_spool or work / "pmxt-events.sqlite"
     pmxt_provenance: list[Provenance] = list(shared_provenance)
     pmxt_events = 0
@@ -477,7 +557,7 @@ def run_partition(
         "release_tag": release_tag,
         "remote_assets": len(assets),
         "source_bytes": binance_bytes
-        + (shared_source_bytes if asset is Asset.DOGE else 0)
+        + shared_source_bytes
         + (0 if shared_spool else sum(item.byte_length for item in pmxt_provenance)),
         "wall_seconds": time.perf_counter() - began,
         "cpu_seconds": time.process_time() - cpu_began,
@@ -500,14 +580,18 @@ def main() -> None:
     args = parser.parse_args()
     current = args.start
     while current <= args.end:
+        selected_assets = tuple(Asset) if args.asset is None else (Asset(args.asset),)
         shared_spool: Path | None = None
         shared_provenance: dict[Asset, tuple[Provenance, ...]] = {}
         shared_source_bytes = 0
         if current >= date(2026, 4, 14):
             shared_spool, shared_provenance, shared_source_bytes = prepare_shared_day(
-                current, args.kacho_root, args.work_root
+                current, args.kacho_root, args.work_root, selected_assets
             )
-        selected_assets = tuple(Asset) if args.asset is None else (Asset(args.asset),)
+        source_bytes_owner = next(
+            (asset for asset in selected_assets if shared_provenance.get(asset)),
+            selected_assets[0],
+        )
         for asset in selected_assets:
             print(
                 json.dumps(
@@ -519,7 +603,7 @@ def main() -> None:
                         args.ledger,
                         shared_spool,
                         shared_provenance.get(asset, ()),
-                        shared_source_bytes,
+                        shared_source_bytes if asset is source_bytes_owner else 0,
                     ),
                     sort_keys=True,
                 ),
