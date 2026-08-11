@@ -577,10 +577,23 @@ def main() -> None:
     parser.add_argument("--start", type=date.fromisoformat, default=date(2026, 4, 5))
     parser.add_argument("--end", type=date.fromisoformat, default=date(2026, 4, 12))
     parser.add_argument("--asset", choices=[asset.value for asset in Asset])
+    parser.add_argument(
+        "--assets",
+        help="comma-separated asset subset; mutually exclusive with --asset",
+    )
     args = parser.parse_args()
+    if args.asset and args.assets:
+        parser.error("--asset and --assets are mutually exclusive")
+    requested_assets = (
+        tuple(Asset(value) for value in args.assets.split(","))
+        if args.assets
+        else ((Asset(args.asset),) if args.asset else tuple(Asset))
+    )
+    if not requested_assets or len(set(requested_assets)) != len(requested_assets):
+        parser.error("--assets must contain a non-empty unique asset subset")
     current = args.start
     while current <= args.end:
-        selected_assets = tuple(Asset) if args.asset is None else (Asset(args.asset),)
+        selected_assets = requested_assets
         shared_spool: Path | None = None
         shared_provenance: dict[Asset, tuple[Provenance, ...]] = {}
         shared_source_bytes = 0

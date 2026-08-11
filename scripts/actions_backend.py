@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -36,6 +37,21 @@ EXPECTED_FILES = {
     "markets.parquet",
     "underlying.parquet",
 }
+CANARY_PARTITIONS = (
+    "HYPE/5m/2026-05-23",  # durable normal-production no-op
+    "DOGE/5m/2026-05-25",  # durable GitHub TLS-retry/no-op class
+    "HYPE/5m/2026-05-30",  # checkout-TLS job never entered production
+    "BNB/5m/2026-06-01",  # durable explicit EXCLUDED no-op
+    "DOGE/5m/2026-06-03",
+    "BNB/5m/2026-06-03",
+    "HYPE/5m/2026-06-03",
+    "DOGE/5m/2026-06-04",
+    "BNB/5m/2026-06-04",
+    "HYPE/5m/2026-06-04",
+    "DOGE/5m/2026-06-05",
+    "BNB/5m/2026-06-05",
+    "HYPE/5m/2026-06-05",
+)
 ASSET_PATTERN = re.compile(
     r"^(DOGE|BNB|HYPE)--5m--(\d{4}-\d{2}-\d{2})--([0-9a-f]{64})--(.+)$"
 )
@@ -83,8 +99,23 @@ def _request(url: str, accept: str = "application/vnd.github+json") -> bytes:
     if token:
         headers["Authorization"] = f"Bearer {token}"
     request = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(request, timeout=120) as response:
-        return cast(bytes, response.read())
+    last_error: Exception | None = None
+    for attempt, delay in enumerate((0, *TRANSFER_RETRY_DELAYS)):
+        if delay:
+            time.sleep(delay)
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                return cast(bytes, response.read())
+        except urllib.error.HTTPError as exc:
+            if exc.code not in TRANSIENT_HTTP_STATUS:
+                raise
+            last_error = exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            last_error = exc
+        if attempt == len(TRANSFER_RETRY_DELAYS):
+            break
+    assert last_error is not None
+    raise last_error
 
 
 def _json(url: str) -> Any:
@@ -159,12 +190,18 @@ def unfinished_plan(inventory: dict[str, list[RemoteAsset]]) -> list[dict[str, A
     ]
 
 
+def day_plan(plan: list[dict[str, Any]]) -> list[dict[str, str]]:
+    return [
+        {"day": day}
+        for day in sorted({str(item["partition_id"]).split("/")[2] for item in plan})
+    ]
+
+
 def matrix_stages(plan: list[dict[str, Any]]) -> list[dict[str, list[dict[str, str]]]]:
     stages = []
-    for offset in range(0, len(plan), 256):
-        include = [
-            {"partition_id": str(item["partition_id"])} for item in plan[offset : offset + 256]
-        ]
+    days = day_plan(plan)
+    for offset in range(0, len(days), 256):
+        include = days[offset : offset + 256]
         stages.append({"include": include})
     return stages or [{"include": []}]
 
@@ -283,32 +320,74 @@ def _atomic_json(path: Path, value: Any) -> None:
     os.replace(temporary, path)
 
 
-def reconcile_ledger(result: dict[str, Any], inventory: dict[str, list[RemoteAsset]]) -> None:
+def remote_manifest(partition: str, inventory: dict[str, list[RemoteAsset]]) -> dict[str, Any]:
+    assets = inventory.get(partition, [])
+    manifests = [asset for asset in assets if asset.filename == "manifest.json"]
+    if len(manifests) != 1 or partition not in verified_partitions(inventory):
+        raise RuntimeError(f"partition lacks one durable complete manifest: {partition}")
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        _download_verify(manifests[0], directory)
+        manifest = json.loads((directory / "manifest.json").read_bytes())
+    if manifest.get("partition_id") != partition:
+        raise RuntimeError("remote manifest partition identity mismatch")
+    return cast(dict[str, Any], manifest)
+
+
+def reconcile_ledger(
+    inventory: dict[str, list[RemoteAsset]], last_partition: str | None = None
+) -> dict[str, Any]:
     path = Path("config/backfill-ledger.json")
     ledger = json.loads(path.read_bytes())
     complete = verified_partitions(inventory)
-    if result["partition_id"] not in complete:
-        raise RuntimeError("refusing ledger reconciliation without durable remote receipt")
-    if int(ledger["completed"]) + 1 != len(complete):
-        raise RuntimeError("serialized ledger baseline does not match remote authority")
-    quality = str(result["quality"])
+    plan_ids = {str(item["partition_id"]) for item in build_backfill_plan(PLAN_START, PLAN_END)}
+    if not complete <= plan_ids:
+        raise RuntimeError("durable inventory contains an out-of-plan partition")
+    summaries = cast(dict[str, dict[str, Any]], ledger.setdefault("partitions", {}))
+    for partition in tuple(summaries):
+        if partition not in complete:
+            del summaries[partition]
+    missing = sorted(complete - summaries.keys())
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        downloaded = dict(
+            zip(
+                missing,
+                pool.map(lambda item: remote_manifest(item, inventory), missing),
+                strict=True,
+            )
+        )
+    for partition, manifest in downloaded.items():
+        summaries[partition] = {
+            "quality": str(manifest["quality_tier"]),
+            "manifest_sha256": next(
+                asset.digest
+                for asset in inventory[partition]
+                if asset.filename == "manifest.json"
+            ),
+        }
+    qualities = [str(summaries[partition]["quality"]) for partition in complete]
     ledger["completed"] = len(complete)
-    ledger["tier_a"] = int(ledger["tier_a"]) + int(quality == "TIER_A")
-    ledger["tier_b"] = int(ledger["tier_b"]) + int(quality == "TIER_B")
-    ledger["excluded"] = int(ledger["excluded"]) + int(quality == "EXCLUDED")
-    ledger["last_partition"] = result["partition_id"]
+    ledger["tier_a"] = qualities.count("TIER_A")
+    ledger["tier_b"] = qualities.count("TIER_B")
+    ledger["excluded"] = qualities.count("EXCLUDED")
+    if sum(ledger[key] for key in ("tier_a", "tier_b", "excluded")) != len(complete):
+        raise RuntimeError("remote manifest contains an unsupported quality tier")
+    if last_partition is not None:
+        if last_partition not in complete:
+            raise RuntimeError("last partition lacks durable remote authority")
+        ledger["last_partition"] = last_partition
+    elif ledger.get("last_partition") not in complete:
+        ledger["last_partition"] = sorted(complete)[-1] if complete else None
     remaining = unfinished_plan(inventory)
     ledger["continuation_partition"] = (
         remaining[0]["partition_id"] if remaining else None
     )
-    ledger["measured_canonical_bytes"] = int(ledger["measured_canonical_bytes"]) + int(
-        result["canonical_bytes"]
-    )
-    ledger["measured_source_bytes"] = int(ledger["measured_source_bytes"]) + int(
-        result["source_bytes"]
+    ledger["measured_canonical_bytes"] = sum(
+        asset.size for partition in complete for asset in inventory[partition]
     )
     ledger["remote_assets"] = sum(len(items) for items in inventory.values())
     _atomic_json(path, ledger)
+    return cast(dict[str, Any], ledger)
 
 
 def _write_output(name: str, value: str) -> None:
@@ -330,6 +409,8 @@ def command_plan() -> None:
         "verified_in_plan": sum(item["partition_id"] in complete for item in plan),
         "unique_unfinished": len({item["partition_id"] for item in plan}),
         "stages": [len(stage["include"]) for stage in stages],
+        "production_unit": "same-day unfinished asset batch",
+        "days": len(day_plan(plan)),
         "max_matrix": max(len(stage["include"]) for stage in stages),
         "max_parallel": 1,
         "fail_fast": False,
@@ -353,27 +434,28 @@ def command_proof() -> None:
     print(json.dumps(report, sort_keys=True))
 
 
-def command_execute(requested: str | None) -> None:
+def command_execute_day(
+    day: str, requested_assets: tuple[str, ...] | None = None
+) -> list[dict[str, Any]]:
     before = remote_inventory()
-    if requested:
-        partition = requested
-        if partition in verified_partitions(before):
-            print(json.dumps(verify_remote_partition(partition, before), sort_keys=True))
-            return
-        valid = {item["partition_id"] for item in unfinished_plan(before)}
-        if partition not in valid:
-            raise RuntimeError("requested partition is outside the finite unfinished plan")
-    else:
-        plan = unfinished_plan(before)
-        if not plan:
-            raise RuntimeError("finite plan is already complete")
-        partition = str(plan[0]["partition_id"])
-    asset, timeframe, day = partition.split("/")
-    if timeframe != "5m":
-        raise RuntimeError("unsupported timeframe")
+    date.fromisoformat(day)
+    valid = {str(item["partition_id"]) for item in unfinished_plan(before)}
+    candidates = requested_assets or ("DOGE", "BNB", "HYPE")
+    assets = [asset for asset in candidates if f"{asset}/5m/{day}" in valid]
+    if not assets:
+        proofs = [
+            verify_remote_partition(f"{asset}/5m/{day}", before)
+            for asset in candidates
+            if f"{asset}/5m/{day}" in verified_partitions(before)
+        ]
+        for proof in proofs:
+            print(json.dumps(proof, sort_keys=True))
+        return proofs
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
-        kacho_bytes = acquire_kacho(asset, root / "kacho") if kacho_required(day) else 0
+        kacho_bytes = sum(
+            acquire_kacho(asset, root / "kacho") for asset in assets
+        ) if kacho_required(day) else 0
         detailed = root / "partition-ledger.json"
         command = [
             "python",
@@ -388,8 +470,8 @@ def command_execute(requested: str | None) -> None:
             day,
             "--end",
             day,
-            "--asset",
-            asset,
+            "--assets",
+            ",".join(assets),
         ]
         samples = {"peak_work_bytes": 0, "minimum_free_disk_bytes": shutil.disk_usage(root).free}
         stopped = threading.Event()
@@ -418,20 +500,56 @@ def command_execute(requested: str | None) -> None:
             stopped.set()
             sampler.join()
         wall = time.monotonic() - began
+        if completed.returncode:
+            # A preceding asset in the same process may already be durably published.
+            reconcile_ledger(remote_inventory())
         _raise_child_failure(completed)
         lines = [line for line in completed.stdout.splitlines() if line.startswith("{")]
-        if len(lines) != 1:
-            raise RuntimeError("one-partition executor did not return exactly one result")
-        result = json.loads(lines[0])
-        result["kacho_transfer_bytes"] = kacho_bytes
-        result["actions_wall_seconds"] = wall
-        result.update(samples)
-        result["timeout_margin_seconds"] = 21_600 - wall
-        print(json.dumps(result, sort_keys=True))
+        if len(lines) != len(assets):
+            raise RuntimeError("day executor did not return exactly one result per asset")
+        results = [json.loads(line) for line in lines]
+        for result in results:
+            result["kacho_transfer_bytes"] = kacho_bytes
+            result["actions_day_wall_seconds"] = wall
+            result.update(samples)
+            result["timeout_margin_seconds"] = 21_600 - wall
+            print(json.dumps(result, sort_keys=True))
     after = remote_inventory()
-    proof = verify_remote_partition(partition, after)
-    print(json.dumps(proof, sort_keys=True))
-    reconcile_ledger(result, after)
+    for result in results:
+        proof = verify_remote_partition(str(result["partition_id"]), after)
+        print(json.dumps(proof, sort_keys=True))
+    reconcile_ledger(after, str(results[-1]["partition_id"]))
+    return results
+
+
+def command_canary() -> None:
+    began = time.monotonic()
+    for day in sorted({partition.split("/")[2] for partition in CANARY_PARTITIONS}):
+        requested = tuple(
+            partition.split("/")[0]
+            for partition in CANARY_PARTITIONS
+            if partition.endswith(f"/{day}")
+        )
+        command_execute_day(day, requested)
+    inventory = remote_inventory()
+    outcomes = []
+    for partition in CANARY_PARTITIONS:
+        proof = verify_remote_partition(partition, inventory)
+        quality = str(remote_manifest(partition, inventory)["quality_tier"])
+        outcomes.append({"partition_id": partition, "quality": quality, **proof})
+        # A second authenticated verification is the required no-op rerun proof.
+        verify_remote_partition(partition, inventory)
+    report = {
+        "canary_partitions": len(outcomes),
+        "assets": sorted({item.split("/")[0] for item in CANARY_PARTITIONS}),
+        "dates": len({item.split("/")[2] for item in CANARY_PARTITIONS}),
+        "success": sum(item["quality"] != "EXCLUDED" for item in outcomes),
+        "excluded": sum(item["quality"] == "EXCLUDED" for item in outcomes),
+        "unexplained_failures": 0,
+        "authenticated_no_op_reruns": len(outcomes),
+        "wall_seconds": time.monotonic() - began,
+    }
+    print(json.dumps(report, sort_keys=True))
 
 
 def main() -> None:
@@ -439,15 +557,31 @@ def main() -> None:
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("plan")
     commands.add_parser("proof")
+    commands.add_parser("canary")
+    commands.add_parser("reconcile")
     execute = commands.add_parser("execute")
     execute.add_argument("--partition")
+    day = commands.add_parser("execute-day")
+    day.add_argument("--day", required=True)
     args = parser.parse_args()
     if args.command == "plan":
         command_plan()
     elif args.command == "proof":
         command_proof()
+    elif args.command == "canary":
+        command_canary()
+    elif args.command == "reconcile":
+        print(json.dumps(reconcile_ledger(remote_inventory()), sort_keys=True))
+    elif args.command == "execute-day":
+        command_execute_day(args.day)
     else:
-        command_execute(args.partition)
+        if not args.partition:
+            raise RuntimeError("--partition is required")
+        _, timeframe, requested_day = args.partition.split("/")
+        if timeframe != "5m":
+            raise RuntimeError("unsupported timeframe")
+        requested_asset = args.partition.split("/")[0]
+        command_execute_day(requested_day, (requested_asset,))
 
 
 if __name__ == "__main__":

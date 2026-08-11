@@ -20,6 +20,7 @@ from scripts.actions_backend import (
     KACHO_TICKS,
     RemoteAsset,
     _raise_child_failure,
+    _request,
     acquire_kacho,
     kacho_required,
     matrix_stages,
@@ -58,6 +59,19 @@ class FakeResponse:
 
 
 class ActionsBackendTests(unittest.TestCase):
+    def test_github_request_retries_tls_transport_failure(self) -> None:
+        tls_failure = urllib.error.URLError("certificate verify failed")
+        with (
+            patch(
+                "scripts.actions_backend.urllib.request.urlopen",
+                side_effect=(tls_failure, FakeResponse(b"{}")),
+            ) as urlopen,
+            patch("scripts.actions_backend.time.sleep") as sleep,
+        ):
+            self.assertEqual(_request("https://api.github.test/releases"), b"{}")
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once_with(2)
+
     def test_child_failure_surfaces_captured_diagnostics(self) -> None:
         completed = subprocess.CompletedProcess(
             ["executor"], 7, stdout="child-out\n", stderr="child-error\n"
@@ -313,8 +327,8 @@ class ActionsBackendTests(unittest.TestCase):
     def test_matrices_are_finite_unique_and_bounded(self) -> None:
         plan = unfinished_plan({})
         stages = matrix_stages(plan)
-        flattened = [item["partition_id"] for stage in stages for item in stage["include"]]
-        self.assertEqual(len(flattened), 375)
-        self.assertEqual(len(set(flattened)), 375)
+        flattened = [item["day"] for stage in stages for item in stage["include"]]
+        self.assertEqual(len(flattened), 125)
+        self.assertEqual(len(set(flattened)), 125)
         self.assertTrue(all(len(stage["include"]) <= 256 for stage in stages))
-        self.assertEqual([len(stage["include"]) for stage in stages], [256, 119])
+        self.assertEqual([len(stage["include"]) for stage in stages], [125])
