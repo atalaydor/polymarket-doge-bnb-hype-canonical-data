@@ -280,21 +280,35 @@ class ActionsBackendTests(unittest.TestCase):
         self.assertNotIn(partition, {item["partition_id"] for item in unfinished_plan(inventory)})
         self.assertEqual(verified_partitions({partition: assets[:-1]}), set())
 
-    def test_proof_partition_is_ledger_frontier_with_remote_evidence(self) -> None:
-        partition = "HYPE/5m/2026-04-05"
-        ledger = {"completed": 3, "last_partition": partition}
-        inventory = {partition: self._assets(partition)}
+    def test_proof_partition_allows_out_of_order_recovery_with_remote_evidence(self) -> None:
+        partition = "HYPE/5m/2026-05-27"
+        other = "DOGE/5m/2026-04-05"
+        ledger = {"completed": 2, "last_partition": partition}
+        inventory = {
+            partition: self._assets(partition),
+            other: self._assets(other),
+        }
         self.assertEqual(select_proof_partition(ledger, inventory), partition)
 
     def test_proof_partition_rejects_inconsistent_or_unsupported_ledger_claim(self) -> None:
         partition = "HYPE/5m/2026-04-05"
-        with self.assertRaisesRegex(RuntimeError, "frontier is inconsistent"):
+        with self.assertRaisesRegex(RuntimeError, "count does not match"):
             select_proof_partition(
                 {"completed": 3, "last_partition": "DOGE/5m/2026-04-05"},
                 {partition: self._assets(partition)},
             )
         with self.assertRaisesRegex(RuntimeError, "lacks durable remote evidence"):
-            select_proof_partition({"completed": 3, "last_partition": partition}, {})
+            inventory = {
+                item: self._assets(item)
+                for item in (
+                    "DOGE/5m/2026-04-05",
+                    "BNB/5m/2026-04-05",
+                    "DOGE/5m/2026-04-06",
+                )
+            }
+            select_proof_partition(
+                {"completed": 3, "last_partition": partition}, inventory
+            )
 
     def test_matrices_are_finite_unique_and_bounded(self) -> None:
         plan = unfinished_plan({})

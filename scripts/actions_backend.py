@@ -137,12 +137,17 @@ def select_proof_partition(
     completed = int(ledger["completed"])
     if completed < 1 or completed > len(plan):
         raise RuntimeError("ledger completed count is outside the finite plan")
-    expected = str(plan[completed - 1]["partition_id"])
-    if ledger.get("last_partition") != expected:
-        raise RuntimeError("ledger completion frontier is inconsistent with the finite plan")
-    if expected not in verified_partitions(inventory):
-        raise RuntimeError(f"ledger proof partition lacks durable remote evidence: {expected}")
-    return expected
+    complete = verified_partitions(inventory)
+    if completed != len(complete):
+        raise RuntimeError("ledger completed count does not match durable remote evidence")
+    requested = str(ledger.get("last_partition", ""))
+    if requested not in {str(item["partition_id"]) for item in plan}:
+        raise RuntimeError("ledger proof partition is outside the finite plan")
+    if requested not in complete:
+        raise RuntimeError(
+            f"ledger proof partition lacks durable remote evidence: {requested}"
+        )
+    return requested
 
 
 def unfinished_plan(inventory: dict[str, list[RemoteAsset]]) -> list[dict[str, Any]]:
@@ -391,7 +396,14 @@ def command_execute(requested: str | None) -> None:
 
         def sample_disk() -> None:
             while not stopped.wait(1):
-                used = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
+                used = 0
+                for path in root.rglob("*"):
+                    try:
+                        if path.is_file():
+                            used += path.stat().st_size
+                    except FileNotFoundError:
+                        # The child removes verified temporary inputs concurrently.
+                        continue
                 samples["peak_work_bytes"] = max(samples["peak_work_bytes"], used)
                 samples["minimum_free_disk_bytes"] = min(
                     samples["minimum_free_disk_bytes"], shutil.disk_usage(root).free
