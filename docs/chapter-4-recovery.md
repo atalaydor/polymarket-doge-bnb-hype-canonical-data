@@ -30,3 +30,9 @@ the frozen stream authority when it is exactly the configured per-asset Chainlin
 and the controlling rules independently name that asset and retain the Up/Down
 comparison semantics. A blank or different source, a cross-asset rule, or missing
 comparison semantics remains an identity failure.
+
+The August 7 official Gamma rules and `resolutionSource` agree on Chainlink's exact
+[DOGE/USD 30-second TWAP stream](https://data.chain.link/streams/doge-usd-twap-30s-streams),
+and explicitly name Dogecoin, Chainlink, and TWAP. Recovery accepts only the finite
+per-asset spot or 30-second-TWAP stream identities; TWAP additionally requires that
+exact URL in the controlling rules plus matching Chainlink, asset, and TWAP wording.
