@@ -9,7 +9,7 @@ from pathlib import Path
 
 from canonical_data.audit import canonical_json_bytes
 from canonical_data.discovery import GammaClient, discover
-from canonical_data.errors import SourceError
+from canonical_data.errors import SourceError, UnresolvedMarketError
 from canonical_data.kacho import read_kacho_parquet
 from canonical_data.manifest import hash_file
 from canonical_data.models import Asset, BookEvent, Exclusion, ExclusionReason, Market, Provenance
@@ -39,7 +39,11 @@ class ProductionSourceLoader:
         self.official_cache_dir = official_cache_dir
 
     def discover(
-        self, asset: Asset, market_starts_s: list[int], allow_missing: bool = False
+        self,
+        asset: Asset,
+        market_starts_s: list[int],
+        allow_missing: bool = False,
+        allow_unresolved: bool = False,
     ) -> OfficialDiscovery:
         markets: list[Market] = []
         provenance: list[Provenance] = []
@@ -60,11 +64,32 @@ class ProductionSourceLoader:
                         handle.flush()
                         os.fsync(handle.fileno())
                     os.replace(temporary, cached)
-            found = discover([payload])
+            unresolved = False
+            try:
+                found = discover([payload])
+            except UnresolvedMarketError as exc:
+                if not allow_unresolved:
+                    raise
+                found = []
+                unresolved = True
+                exclusions.append(
+                    Exclusion(
+                        exc.market_id,
+                        ExclusionReason.UNRESOLVED_MARKET,
+                        "official Gamma market has no final outcome",
+                        {
+                            "condition_id": exc.condition_id,
+                            "payload_sha256": hashlib.sha256(payload).hexdigest(),
+                            "slug": exc.slug,
+                        },
+                    )
+                )
             if len(found) == 1 and found[0].asset is asset:
                 if found[0].market_start_ns != start * 1_000_000_000:
                     raise SourceError("Gamma start does not match inventory")
                 markets.append(found[0])
+            elif unresolved:
+                pass
             elif allow_missing and not found:
                 exclusions.append(
                     Exclusion(
@@ -94,7 +119,7 @@ class ProductionSourceLoader:
         self,
         urls: list[str],
         markets: tuple[Market, ...],
-        max_transfer_per_object: int = 750_000_000,
+        max_transfer_per_object: int = 800_000_000,
         max_scanned_rows_per_object: int = 25_000_000,
         max_filtered_rows_per_object: int = 500_000,
     ) -> PMXTLoad:

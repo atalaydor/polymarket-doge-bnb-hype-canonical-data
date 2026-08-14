@@ -6,6 +6,7 @@ import http.client
 import json
 import os
 import shutil
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -18,6 +19,8 @@ from canonical_data.httpclient import USER_AGENT
 from canonical_data.manifest import hash_file
 
 MAX_RELEASE_ASSET_BYTES = 1_900_000_000
+TRANSIENT_HTTP_STATUS = {408, 429, 500, 502, 503, 504}
+RETRY_DELAYS = (2, 8, 32)
 
 
 class GitHubAPIError(SourceError):
@@ -32,6 +35,8 @@ class ReleaseAsset:
     byte_length: int
     sha256: str
     download_url: str
+    state: str = "uploaded"
+    asset_id: str | None = None
 
 
 class ReleaseBackend(Protocol):
@@ -42,6 +47,8 @@ class ReleaseBackend(Protocol):
     def upload(self, release_id: str, name: str, path: Path) -> ReleaseAsset: ...
 
     def download(self, asset: ReleaseAsset, target: Path) -> None: ...
+
+    def delete_incomplete(self, release_id: str, asset: ReleaseAsset) -> None: ...
 
     def finalize(self, release_id: str) -> None: ...
 
@@ -79,8 +86,14 @@ class Publisher:
             if conflicts:
                 raise ConflictError(f"conflicting remote asset identity: {path.name}")
             asset = existing.get(name)
+            if asset is not None and asset.state != "uploaded":
+                self.backend.delete_incomplete(release_id, asset)
+                existing.pop(name)
+                asset = None
             if asset is None:
                 asset = self.backend.upload(release_id, name, path)
+            if asset.state != "uploaded":
+                raise ConflictError(f"uploaded asset is not durable: {path.name}")
             if asset.byte_length != length or asset.sha256 != digest:
                 raise ConflictError(f"uploaded metadata mismatch: {path.name}")
             self._download_verify(asset, length, digest, directory)
@@ -137,6 +150,12 @@ class DirectoryReleaseBackend:
     def download(self, asset: ReleaseAsset, target: Path) -> None:
         shutil.copyfile(asset.download_url, target)
 
+    def delete_incomplete(self, release_id: str, asset: ReleaseAsset) -> None:
+        del release_id
+        if asset.state == "uploaded":
+            raise ConflictError("refusing to delete a durable release asset")
+        Path(asset.download_url).unlink(missing_ok=True)
+
     def finalize(self, release_id: str) -> None:
         marker = self.root / release_id / ".draft"
         if not marker.exists():
@@ -161,24 +180,39 @@ class GitHubReleaseBackend:
         payload: bytes | None = None,
         content_type: str = "application/json",
     ) -> Any:
-        request = urllib.request.Request(
-            url,
-            data=payload,
-            method=method,
-            headers={
-                "Authorization": f"Bearer {self.token}",
-                "Accept": "application/vnd.github+json",
-                "Content-Type": content_type,
-                "X-GitHub-Api-Version": "2022-11-28",
-                "User-Agent": USER_AGENT,
-            },
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=120) as response:
-                body = response.read()
-        except urllib.error.HTTPError as exc:
-            raise GitHubAPIError(method, exc.code) from exc
-        return json.loads(body) if body else None
+        delays = (0, *RETRY_DELAYS) if method in {"GET", "PATCH", "DELETE"} else (0,)
+        last_error: Exception | None = None
+        for delay in delays:
+            if delay:
+                time.sleep(delay)
+            request = urllib.request.Request(
+                url,
+                data=payload,
+                method=method,
+                headers={
+                    "Authorization": f"Bearer {self.token}",
+                    "Accept": "application/vnd.github+json",
+                    "Content-Type": content_type,
+                    "X-GitHub-Api-Version": "2022-11-28",
+                    "User-Agent": USER_AGENT,
+                },
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=120) as response:
+                    body = response.read()
+                return json.loads(body) if body else None
+            except urllib.error.HTTPError as exc:
+                if exc.code not in TRANSIENT_HTTP_STATUS:
+                    raise GitHubAPIError(method, exc.code) from exc
+                last_error = exc
+            except (urllib.error.URLError, TimeoutError) as exc:
+                last_error = exc
+        assert last_error is not None
+        if isinstance(last_error, urllib.error.HTTPError):
+            raise GitHubAPIError(method, last_error.code) from last_error
+        raise SourceError(
+            f"GitHub API {method} transport failed after bounded retries"
+        ) from last_error
 
     def ensure_draft(self, tag: str) -> str:
         matches: list[dict[str, Any]] = []
@@ -214,6 +248,8 @@ class GitHubReleaseBackend:
                     int(item["size"]),
                     _digest_from_name(item["name"]),
                     item["url"],
+                    str(item.get("state", "")),
+                    str(item["id"]),
                 )
                 for item in raw
             )
@@ -227,43 +263,109 @@ class GitHubReleaseBackend:
         if length >= MAX_RELEASE_ASSET_BYTES:
             raise ResourceLimitError("release asset exceeds repository cap")
         endpoint = f"/repos/{self.repository}/releases/{release_id}/assets?{query}"
-        connection = http.client.HTTPSConnection("uploads.github.com", timeout=120)
-        connection.putrequest("POST", endpoint)
-        connection.putheader("Authorization", f"Bearer {self.token}")
-        connection.putheader("Accept", "application/vnd.github+json")
-        connection.putheader("Content-Type", "application/octet-stream")
-        connection.putheader("Content-Length", str(length))
-        connection.putheader("X-GitHub-Api-Version", "2022-11-28")
-        connection.putheader("User-Agent", USER_AGENT)
-        connection.endheaders()
-        with path.open("rb") as handle:
-            while chunk := handle.read(1_048_576):
-                connection.send(chunk)
-        response = connection.getresponse()
-        body = response.read()
-        connection.close()
-        if response.status not in {200, 201}:
-            raise GitHubAPIError("POST", response.status)
-        raw = json.loads(body)
-        return ReleaseAsset(
-            raw["name"],
-            int(raw["size"]),
-            _digest_from_name(raw["name"]),
-            raw["url"],
-        )
+        last_error: Exception | None = None
+        for delay in (0, *RETRY_DELAYS):
+            if delay:
+                time.sleep(delay)
+            connection = http.client.HTTPSConnection("uploads.github.com", timeout=120)
+            try:
+                connection.putrequest("POST", endpoint)
+                connection.putheader("Authorization", f"Bearer {self.token}")
+                connection.putheader("Accept", "application/vnd.github+json")
+                connection.putheader("Content-Type", "application/octet-stream")
+                connection.putheader("Content-Length", str(length))
+                connection.putheader("X-GitHub-Api-Version", "2022-11-28")
+                connection.putheader("User-Agent", USER_AGENT)
+                connection.endheaders()
+                with path.open("rb") as handle:
+                    while chunk := handle.read(1_048_576):
+                        connection.send(chunk)
+                response = connection.getresponse()
+                body = response.read()
+                if response.status in {200, 201}:
+                    raw = json.loads(body)
+                    asset = ReleaseAsset(
+                        raw["name"],
+                        int(raw["size"]),
+                        _digest_from_name(raw["name"]),
+                        raw["url"],
+                        str(raw.get("state", "")),
+                        str(raw["id"]),
+                    )
+                    if asset.state != "uploaded":
+                        self.delete_incomplete(release_id, asset)
+                        last_error = ConflictError("upload returned a non-durable asset")
+                    else:
+                        return asset
+                elif response.status not in TRANSIENT_HTTP_STATUS | {422}:
+                    raise GitHubAPIError("POST", response.status)
+                else:
+                    last_error = GitHubAPIError("POST", response.status)
+            except (OSError, http.client.HTTPException, TimeoutError) as exc:
+                last_error = exc
+            finally:
+                connection.close()
+            reconciled = self._reconcile_upload(release_id, name, length)
+            if reconciled is not None:
+                return reconciled
+        assert last_error is not None
+        if isinstance(last_error, GitHubAPIError):
+            raise last_error
+        raise SourceError("GitHub upload transport failed after bounded retries") from last_error
+
+    def _reconcile_upload(
+        self, release_id: str, name: str, length: int
+    ) -> ReleaseAsset | None:
+        matches = [asset for asset in self.list_assets(release_id) if asset.name == name]
+        if len(matches) > 1:
+            raise ConflictError("multiple remote assets share one content-addressed name")
+        if not matches:
+            return None
+        asset = matches[0]
+        if asset.state != "uploaded":
+            self.delete_incomplete(release_id, asset)
+            return None
+        if asset.byte_length != length or asset.sha256 != _digest_from_name(name):
+            raise ConflictError("reconciled upload metadata mismatch")
+        return asset
 
     def download(self, asset: ReleaseAsset, target: Path) -> None:
-        request = urllib.request.Request(
-            asset.download_url,
-            headers={
-                "Authorization": f"Bearer {self.token}",
-                "Accept": "application/octet-stream",
-                "X-GitHub-Api-Version": "2022-11-28",
-                "User-Agent": USER_AGENT,
-            },
-        )
-        with urllib.request.urlopen(request, timeout=120) as response, target.open("wb") as handle:
-            shutil.copyfileobj(response, handle, length=1_048_576)
+        last_error: Exception | None = None
+        for delay in (0, *RETRY_DELAYS):
+            if delay:
+                time.sleep(delay)
+            request = urllib.request.Request(
+                asset.download_url,
+                headers={
+                    "Authorization": f"Bearer {self.token}",
+                    "Accept": "application/octet-stream",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                    "User-Agent": USER_AGENT,
+                },
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=120) as response, target.open(
+                    "wb"
+                ) as handle:
+                    shutil.copyfileobj(response, handle, length=1_048_576)
+                return
+            except urllib.error.HTTPError as exc:
+                target.unlink(missing_ok=True)
+                if exc.code not in TRANSIENT_HTTP_STATUS:
+                    raise GitHubAPIError("GET", exc.code) from exc
+                last_error = exc
+            except (urllib.error.URLError, TimeoutError) as exc:
+                target.unlink(missing_ok=True)
+                last_error = exc
+        assert last_error is not None
+        raise SourceError("GitHub download failed after bounded retries") from last_error
+
+    def delete_incomplete(self, release_id: str, asset: ReleaseAsset) -> None:
+        if asset.state == "uploaded":
+            raise ConflictError("refusing to delete a durable release asset")
+        if asset.asset_id is None:
+            raise ConflictError("incomplete release asset lacks an API identity")
+        self._request("DELETE", f"{self.api}/releases/assets/{asset.asset_id}")
 
     def finalize(self, release_id: str) -> None:
         self._request(
@@ -288,6 +390,8 @@ def download_and_verify_release(
     target.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
     for asset in backend.list_assets(release_id):
+        if asset.state != "uploaded":
+            raise ConflictError(f"release contains a non-durable asset: {asset.name}")
         path = target / asset.name
         backend.download(asset, path)
         length, digest = hash_file(path)

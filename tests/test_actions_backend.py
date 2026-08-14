@@ -13,7 +13,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from canonical_data.errors import SourceError
+from canonical_data.errors import ResourceLimitError, SourceError
+from canonical_data.inventory import SourceObject
 from canonical_data.models import Asset, Exclusion, ExclusionReason, Provenance
 from scripts.actions_backend import (
     KACHO_REVISION,
@@ -22,13 +23,21 @@ from scripts.actions_backend import (
     _raise_child_failure,
     _request,
     acquire_kacho,
+    inventory_anomalies,
     kacho_required,
     matrix_stages,
     select_proof_partition,
     unfinished_plan,
     verified_partitions,
 )
-from scripts.run_backfill import _fetch_gamma, prepare_shared_day, run_partition
+from scripts.run_backfill import (
+    MAX_SOURCE_OBJECT_BYTES,
+    PMXT_HTTP_404_GAPS,
+    _acquire_with_retry,
+    _fetch_gamma,
+    prepare_shared_day,
+    run_partition,
+)
 
 
 class FakeResponse:
@@ -107,6 +116,34 @@ class ActionsBackendTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(SourceError, "configured bound"):
                 _fetch_gamma("https://example.test/gamma", 2)
+
+    def test_acquisition_does_not_retry_limits_or_unexplained_404(self) -> None:
+        source = SourceObject("pmxt_v2", "https://example.test/hour.parquet")
+        missing = urllib.error.HTTPError(source.url, 404, "Not Found", Message(), None)
+        for failure in (ResourceLimitError("cap"), missing):
+            with (
+                patch(
+                    "scripts.run_backfill.BoundedAcquirer.acquire", side_effect=failure
+                ) as acquire,
+                patch("scripts.run_backfill.time.sleep") as sleep,
+                TemporaryDirectory() as temporary,
+            ):
+                with self.assertRaises(type(failure)):
+                    _acquire_with_retry(source, Path(temporary))
+            acquire.assert_called_once()
+            sleep.assert_not_called()
+
+    def test_recovery_source_bound_and_exact_declared_gaps_are_finite(self) -> None:
+        self.assertEqual(MAX_SOURCE_OBJECT_BYTES, 800_000_000)
+        self.assertGreater(MAX_SOURCE_OBJECT_BYTES, 764_905_077)
+        self.assertEqual(
+            sorted(PMXT_HTTP_404_GAPS),
+            [
+                "https://r2v2.pmxt.dev/polymarket_orderbook_2026-06-11T04.parquet",
+                "https://r2v2.pmxt.dev/polymarket_orderbook_2026-06-11T05.parquet",
+                "https://r2v2.pmxt.dev/polymarket_orderbook_2026-06-11T06.parquet",
+            ],
+        )
 
     def test_all_missing_official_inventory_skips_pmxt_acquisition(self) -> None:
         class MissingLoader:
@@ -293,6 +330,19 @@ class ActionsBackendTests(unittest.TestCase):
         self.assertEqual(verified_partitions(inventory), {partition})
         self.assertNotIn(partition, {item["partition_id"] for item in unfinished_plan(inventory)})
         self.assertEqual(verified_partitions({partition: assets[:-1]}), set())
+        starter = [*assets]
+        starter[0] = RemoteAsset(
+            starter[0].name,
+            starter[0].size,
+            starter[0].url,
+            starter[0].digest,
+            starter[0].filename,
+            "starter",
+            "513096757",
+        )
+        starter_inventory = {partition: starter}
+        self.assertEqual(verified_partitions(starter_inventory), set())
+        self.assertEqual(inventory_anomalies(starter_inventory)["partial"], [partition])
 
     def test_proof_partition_allows_out_of_order_recovery_with_remote_evidence(self) -> None:
         partition = "HYPE/5m/2026-05-27"

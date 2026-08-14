@@ -11,6 +11,7 @@ on:
           - proof
           - canary
           - one-partition
+          - recovery-canary
           - dry-plan
           - full-backfill
       partition:
@@ -124,6 +125,85 @@ jobs:
           git add config/backfill-ledger.json
           git commit -m "Chapter 4 checkpoint - representative canary"
           git push origin HEAD:main
+
+  recovery-verify:
+    if: ${{ inputs.mode == 'recovery-canary' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions: {}
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+      - run: |
+          python -m pip install --disable-pip-version-check --no-cache-dir .
+          python -m pip install --disable-pip-version-check --no-cache-dir ruff==0.12.12 mypy==1.17.1
+      - run: python -m unittest discover -s tests -v
+      - run: ruff check .
+      - run: mypy
+      - run: git diff --check
+
+  recovery-day:
+    if: ${{ inputs.mode == 'recovery-canary' }}
+    needs: recovery-verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        day:
+          - "2026-06-09"
+          - "2026-06-10"
+          - "2026-06-11"
+          - "2026-07-29"
+          - "2026-08-05"
+          - "2026-08-07"
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          fetch-depth: 0
+      - run: python -m pip install --disable-pip-version-check --no-cache-dir .
+      - run: git pull --ff-only origin main
+      - name: Recover exact unfinished same-day asset batch
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python scripts/actions_backend.py execute-day --day "${{ matrix.day }}"
+      - name: Serialize aggregate recovery checkpoint
+        run: |
+          if git diff --quiet -- config/backfill-ledger.json; then exit 0; fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add config/backfill-ledger.json
+          git commit -m "Chapter 4 checkpoint - bounded recovery"
+          git push origin HEAD:main
+
+  certify-recovery:
+    if: ${{ inputs.mode == 'recovery-canary' }}
+    needs: recovery-day
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          fetch-depth: 0
+      - run: python -m pip install --disable-pip-version-check --no-cache-dir .
+      - run: git pull --ff-only origin main
+      - name: Reconcile and certify all 375 durable partitions
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python scripts/actions_backend.py certify
+      - name: Commit certification checkpoint and immutable Chapter 4 tag
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add config/backfill-ledger.json docs/chapter-4-certification.json
+          git commit -m "Chapter 4 complete - certified"
+          git tag -a chapter-4-certified-v1 -m "Chapter 4 complete - 375 durable partitions"
+          git push origin HEAD:main
+          git push origin refs/tags/chapter-4-certified-v1
 
   stage-0:
     if: ${{ inputs.mode == 'full-backfill' && needs.plan.outputs.matrix_0 != '{"include":[]}' }}

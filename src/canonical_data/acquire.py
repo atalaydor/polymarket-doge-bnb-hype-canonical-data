@@ -38,7 +38,7 @@ class BoundedAcquirer:
     def __init__(
         self,
         work_dir: Path,
-        max_object_bytes: int = 750_000_000,
+        max_object_bytes: int = 800_000_000,
         min_free_bytes: int = 8_000_000_000,
     ):
         self.work_dir = work_dir

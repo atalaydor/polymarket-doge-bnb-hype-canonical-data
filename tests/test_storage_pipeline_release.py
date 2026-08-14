@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+import urllib.error
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pyarrow.parquet as pq
 from helpers import market, pmxt_rows, provenance
@@ -15,6 +17,7 @@ from canonical_data.manifest import (
     build_manifest,
     build_notice,
     build_release_index,
+    hash_file,
     verify_manifest,
 )
 from canonical_data.models import (
@@ -30,6 +33,7 @@ from canonical_data.release import (
     DirectoryReleaseBackend,
     GitHubReleaseBackend,
     Publisher,
+    ReleaseAsset,
     download_and_verify_release,
 )
 from canonical_data.resample import resample_200ms
@@ -524,6 +528,116 @@ class FailingOnceBackend(DirectoryReleaseBackend):
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_github_inventory_retries_tls_without_disabling_verification(self) -> None:
+        class Response:
+            def __enter__(self) -> Response:
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b"[]"
+
+        backend = GitHubReleaseBackend("owner/repository", "token")
+        with (
+            patch(
+                "canonical_data.release.urllib.request.urlopen",
+                side_effect=(urllib.error.URLError("certificate verify failed"), Response()),
+            ) as urlopen,
+            patch("canonical_data.release.time.sleep") as sleep,
+        ):
+            self.assertEqual(backend._request("GET", "https://api.example.test"), [])
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once_with(2)
+
+    def test_exact_non_durable_asset_is_removed_before_idempotent_upload(self) -> None:
+        class StarterBackend(DirectoryReleaseBackend):
+            def __init__(self, root: Path) -> None:
+                super().__init__(root)
+                self.starter: ReleaseAsset | None = None
+                self.deleted = False
+
+            def list_assets(self, release_id: str) -> list[ReleaseAsset]:
+                assets = super().list_assets(release_id)
+                return ([self.starter] if self.starter is not None else []) + assets
+
+            def delete_incomplete(self, release_id: str, asset: ReleaseAsset) -> None:
+                del release_id
+                self.assert_not_uploaded(asset)
+                self.starter = None
+                self.deleted = True
+
+            @staticmethod
+            def assert_not_uploaded(asset: ReleaseAsset) -> None:
+                if asset.state == "uploaded":
+                    raise AssertionError("durable asset deletion attempted")
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            fixture = self._fixture(root)
+            backend = StarterBackend(root / "remote")
+            backend.ensure_draft("pilot")
+            path = fixture / "book.parquet"
+            length, digest = hash_file(path)
+            name = f"DOGE--5m--2026-04-13--{digest}--book.parquet"
+            backend.starter = ReleaseAsset(
+                name, length, digest, "https://example.test/starter", "starter", "1"
+            )
+            assets = Publisher(backend).publish_partition(
+                "pilot", "DOGE/5m/2026-04-13", fixture
+            )
+            self.assertTrue(backend.deleted)
+            self.assertTrue(all(asset.state == "uploaded" for asset in assets))
+
+    def test_github_502_upload_reconciles_completed_content_addressed_asset(self) -> None:
+        class Response:
+            status = 502
+
+            def read(self) -> bytes:
+                return b""
+
+        class Connection:
+            def putrequest(self, method: str, endpoint: str) -> None:
+                del method, endpoint
+
+            def putheader(self, name: str, value: str) -> None:
+                del name, value
+
+            def endheaders(self) -> None:
+                return None
+
+            def send(self, chunk: bytes) -> None:
+                del chunk
+
+            def getresponse(self) -> Response:
+                return Response()
+
+            def close(self) -> None:
+                return None
+
+        class ReconcilingBackend(GitHubReleaseBackend):
+            def __init__(self, expected: ReleaseAsset) -> None:
+                super().__init__("owner/repository", "token")
+                self.expected = expected
+
+            def list_assets(self, release_id: str) -> list[ReleaseAsset]:
+                del release_id
+                return [self.expected]
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "manifest.json"
+            path.write_bytes(b"canonical")
+            length, digest = hash_file(path)
+            name = f"DOGE--5m--2026-04-13--{digest}--manifest.json"
+            expected = ReleaseAsset(name, length, digest, "https://api.example.test/asset")
+            backend = ReconcilingBackend(expected)
+            with patch(
+                "canonical_data.release.http.client.HTTPSConnection",
+                return_value=Connection(),
+            ):
+                self.assertEqual(backend.upload("42", name, path), expected)
+
     def test_github_draft_lookup_enumerates_drafts_instead_of_tag_endpoint(self) -> None:
         class FakeGitHub(GitHubReleaseBackend):
             def __init__(self) -> None:

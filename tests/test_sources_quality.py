@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import tempfile
 import unittest
 import zipfile
@@ -115,6 +116,21 @@ class InventoryAndAcquisitionTests(unittest.TestCase):
         ).discover(Asset.DOGE, [START_NS // 1_000_000_000], allow_missing=True)
         self.assertEqual(result.markets, ())
         self.assertEqual(result.exclusions[0].reason_code, ExclusionReason.SOURCE_GAP)
+        self.assertEqual(len(result.provenance), 1)
+
+    def test_official_unresolved_slot_is_only_excluded_after_full_binding(self) -> None:
+        raw = json.loads(gamma_payload())
+        raw[0]["markets"][0]["closed"] = False
+        result = ProductionSourceLoader(
+            GammaClient(lambda _url, _limit: json.dumps(raw).encode()), 7
+        ).discover(
+            Asset.DOGE,
+            [START_NS // 1_000_000_000],
+            allow_unresolved=True,
+        )
+        self.assertEqual(result.markets, ())
+        self.assertEqual(result.exclusions[0].reason_code, ExclusionReason.UNRESOLVED_MARKET)
+        self.assertEqual(result.exclusions[0].evidence["condition_id"], CONDITION)
         self.assertEqual(len(result.provenance), 1)
 
     def test_seekable_range_reader_ledgers_and_enforces_cap(self) -> None:

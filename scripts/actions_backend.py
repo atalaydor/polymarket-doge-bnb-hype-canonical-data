@@ -17,7 +17,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlsplit
@@ -87,6 +87,9 @@ class RemoteAsset:
     url: str
     digest: str
     filename: str
+    state: str = "uploaded"
+    asset_id: str | None = None
+    release_tag: str | None = None
 
 
 def _request(url: str, accept: str = "application/vnd.github+json") -> bytes:
@@ -126,7 +129,8 @@ def remote_inventory() -> dict[str, list[RemoteAsset]]:
     releases = _json(f"{API}/releases?per_page=100")
     result: dict[str, list[RemoteAsset]] = {}
     for release in releases:
-        if not str(release.get("tag_name", "")).startswith("dataset-v1-"):
+        release_tag = str(release.get("tag_name", ""))
+        if not release_tag.startswith("dataset-v1-"):
             continue
         release_id = int(release["id"])
         for page in range(1, 11):
@@ -134,8 +138,12 @@ def remote_inventory() -> dict[str, list[RemoteAsset]]:
             for item in assets:
                 match = ASSET_PATTERN.fullmatch(str(item["name"]))
                 if match is None:
-                    continue
+                    raise RuntimeError(
+                        f"dataset release contains a noncanonical asset name: {item['name']}"
+                    )
                 partition = f"{match[1]}/5m/{match[2]}"
+                if release_tag != f"dataset-v1-{match[2][:7]}":
+                    raise RuntimeError(f"partition is published in the wrong release: {partition}")
                 result.setdefault(partition, []).append(
                     RemoteAsset(
                         str(item["name"]),
@@ -143,6 +151,9 @@ def remote_inventory() -> dict[str, list[RemoteAsset]]:
                         str(item["url"]),
                         match[3],
                         match[4],
+                        str(item.get("state", "")),
+                        str(item["id"]),
+                        release_tag,
                     )
                 )
             if len(assets) < 100:
@@ -156,7 +167,11 @@ def verified_partitions(inventory: dict[str, list[RemoteAsset]]) -> set[str]:
     verified: set[str] = set()
     for partition, assets in inventory.items():
         filenames = [asset.filename for asset in assets]
-        if len(assets) == len(EXPECTED_FILES) and set(filenames) == EXPECTED_FILES:
+        if (
+            len(assets) == len(EXPECTED_FILES)
+            and set(filenames) == EXPECTED_FILES
+            and all(asset.state == "uploaded" for asset in assets)
+        ):
             verified.add(partition)
     return verified
 
@@ -188,6 +203,29 @@ def unfinished_plan(inventory: dict[str, list[RemoteAsset]]) -> list[dict[str, A
         for item in build_backfill_plan(PLAN_START, PLAN_END)
         if item["partition_id"] not in complete
     ]
+
+
+def inventory_anomalies(inventory: dict[str, list[RemoteAsset]]) -> dict[str, list[str]]:
+    plan_ids = {
+        str(item["partition_id"]) for item in build_backfill_plan(PLAN_START, PLAN_END)
+    }
+    verified = verified_partitions(inventory)
+    partial = sorted(
+        partition
+        for partition, assets in inventory.items()
+        if partition in plan_ids and partition not in verified and assets
+    )
+    divergent = sorted(
+        f"{partition}/{filename}"
+        for partition, assets in inventory.items()
+        for filename in {asset.filename for asset in assets}
+        if len({asset.digest for asset in assets if asset.filename == filename}) > 1
+    )
+    return {
+        "partial": partial,
+        "divergent": divergent,
+        "out_of_plan": sorted(set(inventory) - plan_ids),
+    }
 
 
 def day_plan(plan: list[dict[str, Any]]) -> list[dict[str, str]]:
@@ -347,6 +385,16 @@ def reconcile_ledger(
     for partition in tuple(summaries):
         if partition not in complete:
             del summaries[partition]
+    for partition in complete & summaries.keys():
+        remote_digest = next(
+            asset.digest
+            for asset in inventory[partition]
+            if asset.filename == "manifest.json"
+        )
+        if summaries[partition].get("manifest_sha256") != remote_digest:
+            raise RuntimeError(
+                f"ledger manifest digest diverges from remote authority: {partition}"
+            )
     missing = sorted(complete - summaries.keys())
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
         downloaded = dict(
@@ -414,6 +462,8 @@ def command_plan() -> None:
         "max_matrix": max(len(stage["include"]) for stage in stages),
         "max_parallel": 1,
         "fail_fast": False,
+        "gaps": [str(item["partition_id"]) for item in plan],
+        "anomalies": inventory_anomalies(inventory),
     }
     print(json.dumps(report, sort_keys=True))
     _write_output("matrix_0", json.dumps(stages[0], separators=(",", ":")))
@@ -552,6 +602,46 @@ def command_canary() -> None:
     print(json.dumps(report, sort_keys=True))
 
 
+def command_certify() -> None:
+    inventory = remote_inventory()
+    anomalies = inventory_anomalies(inventory)
+    complete = verified_partitions(inventory)
+    if len(complete) != 375 or any(anomalies.values()):
+        raise RuntimeError(
+            "Chapter 4 certification requires exactly 375 durable partitions and no anomalies"
+        )
+    ledger = reconcile_ledger(inventory)
+    if int(ledger["completed"]) != 375 or ledger["continuation_partition"] is not None:
+        raise RuntimeError("reconciled ledger is not complete")
+    report = {
+        "schema_version": "1.0.0",
+        "chapter": 4,
+        "status": "CERTIFIED",
+        "certified_at": datetime.now(UTC).isoformat(),
+        "release_cutoff": "2026-08-07T15:00:00Z",
+        "planned": 375,
+        "durable": 375,
+        "tier_a": int(ledger["tier_a"]),
+        "tier_b": int(ledger["tier_b"]),
+        "excluded": int(ledger["excluded"]),
+        "unfinished": 0,
+        "remote_assets": sum(len(items) for items in inventory.values()),
+        "release_tags": sorted(
+            {
+                asset.release_tag
+                for assets in inventory.values()
+                for asset in assets
+                if asset.release_tag is not None
+            }
+        ),
+        "anomalies": anomalies,
+        "durable_identity": "content-addressed asset names and embedded partition manifests",
+        "github_run_id": os.environ.get("GITHUB_RUN_ID"),
+    }
+    _atomic_json(Path("docs/chapter-4-certification.json"), report)
+    print(json.dumps(report, sort_keys=True))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
@@ -559,6 +649,7 @@ def main() -> None:
     commands.add_parser("proof")
     commands.add_parser("canary")
     commands.add_parser("reconcile")
+    commands.add_parser("certify")
     execute = commands.add_parser("execute")
     execute.add_argument("--partition")
     day = commands.add_parser("execute-day")
@@ -572,6 +663,8 @@ def main() -> None:
         command_canary()
     elif args.command == "reconcile":
         print(json.dumps(reconcile_ledger(remote_inventory()), sort_keys=True))
+    elif args.command == "certify":
+        command_certify()
     elif args.command == "execute-day":
         command_execute_day(args.day)
     else:

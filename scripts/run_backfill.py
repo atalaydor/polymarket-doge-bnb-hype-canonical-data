@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import importlib
 import json
 import os
-import resource
 import shutil
 import subprocess
 import time
@@ -53,6 +54,23 @@ KACHO_FILES = {
 }
 
 PMXT_FILTERED_ROWS_PER_ASSET_OBJECT = 500_000
+MAX_SOURCE_OBJECT_BYTES = 800_000_000
+PMXT_HTTP_404_GAPS = {
+    f"https://r2v2.pmxt.dev/polymarket_orderbook_2026-06-11T{hour}.parquet": {
+        "accessed_at": "2026-08-14",
+        "http_status": 404,
+    }
+    for hour in ("04", "05", "06")
+}
+
+
+def _peak_rss_kib() -> int:
+    """Return Unix peak RSS while keeping metadata-only Windows imports usable."""
+    try:
+        resource_module = cast(Any, importlib.import_module("resource"))
+    except ModuleNotFoundError:
+        return 0
+    return int(resource_module.getrusage(resource_module.RUSAGE_SELF).ru_maxrss)
 
 
 def enforce_shared_pmxt_asset_caps(
@@ -201,7 +219,9 @@ def _load_pmxt_hour(
         if delay:
             time.sleep(delay)
         try:
-            acquired = BoundedAcquirer(raw_dir, 750_000_000, 8_000_000_000).acquire(source)
+            acquired = BoundedAcquirer(
+                raw_dir, MAX_SOURCE_OBJECT_BYTES, 8_000_000_000
+            ).acquire(source)
             loaded = loader.load_downloaded_pmxt(
                 acquired.path, source.url, markets, acquired.etag
             )
@@ -215,13 +235,21 @@ def _load_pmxt_hour(
     raise last
 
 
-def _acquire_with_retry(source: SourceObject, raw_dir: Path) -> Any:
+def _acquire_with_retry(
+    source: SourceObject, raw_dir: Path, max_object_bytes: int = MAX_SOURCE_OBJECT_BYTES
+) -> Any:
     last: Exception | None = None
     for attempt, delay in enumerate((0, *RETRY_DELAYS)):
         if delay:
             time.sleep(delay)
         try:
-            return BoundedAcquirer(raw_dir, 750_000_000, 8_000_000_000).acquire(source)
+            return BoundedAcquirer(raw_dir, max_object_bytes, 8_000_000_000).acquire(source)
+        except ResourceLimitError:
+            raise
+        except urllib.error.HTTPError as exc:
+            if exc.code not in TRANSIENT_HTTP_STATUS:
+                raise
+            last = exc
         except (SourceError, urllib.error.URLError, TimeoutError) as exc:
             last = exc
         if attempt == len(RETRY_DELAYS):
@@ -263,7 +291,12 @@ def prepare_shared_day(
             time.time_ns(),
             work_root / f"{asset.value}-{day}" / "official",
         )
-        discoveries[asset] = (loader, loader.discover(asset, starts, allow_missing=True))
+        discoveries[asset] = (
+            loader,
+            loader.discover(
+                asset, starts, allow_missing=True, allow_unresolved=True
+            ),
+        )
     if not any(discoveries[asset][1].markets for asset in assets):
         spool_path = shared / "events.sqlite"
         with EventSpool(spool_path):
@@ -280,6 +313,12 @@ def prepare_shared_day(
         spool.drop_index()
         for source in pmxt_hourly_objects(inventory_start_ns, day_end_ns):
             if source.url in state["completed_urls"]:
+                continue
+            if source.url in PMXT_HTTP_404_GAPS:
+                state.setdefault("source_gaps", {})[source.url] = PMXT_HTTP_404_GAPS[
+                    source.url
+                ]
+                _atomic_json(state_path, state)
                 continue
             acquired = _acquire_with_retry(source, shared / "raw")
             markets_by_asset = {asset: discoveries[asset][1].markets for asset in assets}
@@ -303,10 +342,26 @@ def prepare_shared_day(
             _atomic_json(state_path, state)
             acquired.path.unlink(missing_ok=True)
         spool.ensure_index()
+    gap_provenance = tuple(
+        Provenance(
+            source_id="pmxt_v2",
+            source_url=url,
+            retrieved_at_ns=1_786_665_600_000_000_000,
+            byte_length=0,
+            sha256=hashlib.sha256(canonical_json_bytes(evidence)).hexdigest(),
+            license_id="CC-BY-4.0",
+            source_precision="http_status",
+            transformations=("authoritative_http_404_absence",),
+        )
+        for url, evidence in sorted(state.get("source_gaps", {}).items())
+    )
     provenance = {
-        asset: tuple(
-            _provenance_from_json(item[asset.value])
-            for _, item in sorted(state["completed_urls"].items())
+        asset: (
+            *tuple(
+                _provenance_from_json(item[asset.value])
+                for _, item in sorted(state["completed_urls"].items())
+            ),
+            *gap_provenance,
         )
         for asset in assets
     }
@@ -347,8 +402,8 @@ def run_tier_b(
     filename = f"{symbol}-1m-{day.isoformat()}.zip"
     url = f"{binance_root}/klines/{symbol}/1m/{filename}"
     checksum = _fetch_text(url + ".CHECKSUM").split()[0]
-    acquired = BoundedAcquirer(work / "raw", 10_000_000, 8_000_000_000).acquire(
-        SourceObject("binance_public", url, checksum)
+    acquired = _acquire_with_retry(
+        SourceObject("binance_public", url, checksum), work / "raw", 10_000_000
     )
     observations = ingest_binance_zip(acquired.path, checksum, asset, "klines", url)
     binance_bytes, binance_digest = hash_file(acquired.path)
@@ -432,7 +487,9 @@ def run_partition(
     loader = ProductionSourceLoader(
         GammaClient(fetch=_fetch_gamma), time.time_ns(), work / "official"
     )
-    discovered = loader.discover(asset, starts, allow_missing=True)
+    discovered = loader.discover(
+        asset, starts, allow_missing=True, allow_unresolved=True
+    )
     if not discovered.markets:
         inputs = PartitionInputs(
             asset,
@@ -468,7 +525,7 @@ def run_partition(
             "source_bytes": 0,
             "wall_seconds": time.perf_counter() - began,
             "cpu_seconds": time.process_time() - cpu_began,
-            "peak_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+            "peak_rss_kib": _peak_rss_kib(),
         }
         ledger["partitions"][partition_id] = result
         _atomic_json(ledger_path, ledger)
@@ -504,8 +561,8 @@ def run_partition(
     filename = f"{symbol}-1m-{day.isoformat()}.zip"
     url = f"{binance_root}/klines/{symbol}/1m/{filename}"
     checksum = _fetch_text(url + ".CHECKSUM").split()[0]
-    acquired = BoundedAcquirer(work / "raw", 10_000_000, 8_000_000_000).acquire(
-        SourceObject("binance_public", url, checksum)
+    acquired = _acquire_with_retry(
+        SourceObject("binance_public", url, checksum), work / "raw", 10_000_000
     )
     observations = ingest_binance_zip(acquired.path, checksum, asset, "klines", url)
     binance_bytes, binance_digest = hash_file(acquired.path)
@@ -561,7 +618,7 @@ def run_partition(
         + (0 if shared_spool else sum(item.byte_length for item in pmxt_provenance)),
         "wall_seconds": time.perf_counter() - began,
         "cpu_seconds": time.process_time() - cpu_began,
-        "peak_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+        "peak_rss_kib": _peak_rss_kib(),
     }
     ledger["partitions"][partition_id] = result
     _atomic_json(ledger_path, ledger)

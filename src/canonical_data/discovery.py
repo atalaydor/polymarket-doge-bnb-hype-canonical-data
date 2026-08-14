@@ -12,7 +12,7 @@ from decimal import Decimal
 from typing import Any, cast
 
 from canonical_data.audit import canonical_json_bytes
-from canonical_data.errors import IdentityError
+from canonical_data.errors import IdentityError, UnresolvedMarketError
 from canonical_data.httpclient import USER_AGENT
 from canonical_data.models import Asset, Market, Outcome, QualityTier
 
@@ -79,6 +79,23 @@ def _official_outcome(prices: list[Any]) -> Outcome:
     raise IdentityError("closed market lacks an unambiguous official outcome")
 
 
+def _rules_bind_stream(asset: Asset, rules: str, source_url: object) -> str:
+    """Bind the exact stream from controlling rules plus the Gamma source field."""
+    expected = ASSET_STREAMS[asset]
+    declared = source_url.strip().rstrip("/") if isinstance(source_url, str) else ""
+    rules_lower = rules.lower()
+    rules_name_stream = (
+        "chainlink" in rules_lower and f"{asset.value.lower()}/usd" in rules_lower
+    )
+    rules_url_stream = expected in rules or f"{expected}/" in rules
+    if declared == expected and (rules_url_stream or rules_name_stream):
+        return expected
+    # The per-market rules are controlling when Gamma leaves its redundant summary field blank.
+    if not declared and rules_url_stream:
+        return expected
+    raise IdentityError("rules do not bind the frozen Chainlink stream")
+
+
 def bind_gamma_market(event: dict[str, Any], retrieved_payload: bytes) -> Market:
     markets = event.get("markets")
     if not isinstance(markets, list) or len(markets) != 1 or not isinstance(markets[0], dict):
@@ -88,6 +105,7 @@ def bind_gamma_market(event: dict[str, Any], retrieved_payload: bytes) -> Market
     match = SLUG.fullmatch(slug) if isinstance(slug, str) else None
     if match is None:
         raise IdentityError("unsupported market slug")
+    slug = cast(str, slug)
     asset = Asset(match.group(1).upper())
     start_ns = int(match.group(2)) * 1_000_000_000
     end_ns = start_ns + 300_000_000_000
@@ -106,19 +124,18 @@ def bind_gamma_market(event: dict[str, Any], retrieved_payload: bytes) -> Market
     source_url = raw.get("resolutionSource")
     if not isinstance(rules, str) or not rules.strip():
         raise IdentityError("rules are missing")
-    if source_url != ASSET_STREAMS[asset] or source_url not in rules:
-        raise IdentityError("rules do not bind the frozen Chainlink stream")
+    bound_source_url = _rules_bind_stream(asset, rules, source_url)
     if "greater than or equal" not in rules.lower() or "otherwise" not in rules.lower():
         raise IdentityError("rules do not prove Up/Down comparison semantics")
-    if raw.get("closed") is not True:
-        raise IdentityError("market is unresolved")
-    outcome = _official_outcome(_json_list(raw.get("outcomePrices"), "outcomePrices"))
-    evidence_digest = hashlib.sha256(retrieved_payload).hexdigest()
-    rules_digest = hashlib.sha256(rules.encode()).hexdigest()
     event_id = str(event.get("id", ""))
     market_id = str(raw.get("id", ""))
     if not event_id or not market_id:
         raise IdentityError("official ids are missing")
+    if raw.get("closed") is not True:
+        raise UnresolvedMarketError(slug, market_id, condition_id)
+    outcome = _official_outcome(_json_list(raw.get("outcomePrices"), "outcomePrices"))
+    evidence_digest = hashlib.sha256(retrieved_payload).hexdigest()
+    rules_digest = hashlib.sha256(rules.encode()).hexdigest()
     return Market(
         asset=asset,
         event_id=event_id,
@@ -129,7 +146,7 @@ def bind_gamma_market(event: dict[str, Any], retrieved_payload: bytes) -> Market
         market_start_ns=start_ns,
         market_end_ns=end_ns,
         rules_text_sha256=rules_digest,
-        resolution_source_url=source_url,
+        resolution_source_url=bound_source_url,
         official_outcome=outcome,
         official_resolution_ts_ns=None,
         quality_tier=QualityTier.TIER_A,

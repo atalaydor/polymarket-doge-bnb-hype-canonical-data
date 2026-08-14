@@ -7,7 +7,7 @@
     "max_derived_samples_per_partition":1000000,
     "max_underlying_rows_per_partition":1000000,
     "max_transformed_partition_bytes":1000000000,
-    "max_source_object_bytes":750000000,
+    "max_source_object_bytes":800000000,
     "max_pmxt_scanned_rows_per_object":25000000,
     "max_pmxt_filtered_rows_per_object":500000,
     "max_release_asset_bytes":1900000000,

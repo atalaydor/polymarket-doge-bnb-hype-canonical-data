@@ -55,6 +55,24 @@ class DiscoveryTests(unittest.TestCase):
         with self.assertRaises(IdentityError):
             discover([json.dumps(raw).encode()])
 
+    def test_binds_exact_stream_when_redundant_source_field_is_blank(self) -> None:
+        raw = json.loads(gamma_payload())
+        raw[0]["markets"][0]["resolutionSource"] = ""
+        found = discover([json.dumps(raw).encode()])
+        self.assertEqual(
+            found[0].resolution_source_url,
+            "https://data.chain.link/streams/doge-usd",
+        )
+
+    def test_binds_named_chainlink_stream_across_official_fields(self) -> None:
+        raw = json.loads(gamma_payload())
+        raw[0]["markets"][0]["description"] = (
+            "Up if the DOGE price is greater than or equal to its start value; otherwise Down. "
+            "The resolution source is the Chainlink DOGE/USD data stream."
+        )
+        found = discover([json.dumps(raw).encode()])
+        self.assertEqual(found[0].official_outcome.value, "UP")
+
     def test_rejects_unresolved_and_ambiguous_outcome(self) -> None:
         raw = json.loads(gamma_payload(outcome_prices=["0.7", "0.3"]))
         with self.assertRaises(IdentityError):
