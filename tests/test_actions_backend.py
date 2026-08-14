@@ -206,6 +206,7 @@ class ActionsBackendTests(unittest.TestCase):
                 patch("scripts.run_backfill.ProductionSourceLoader", MissingLoader),
                 patch("scripts.run_backfill._fetch_text") as fetch_binance,
                 patch("scripts.run_backfill._tool_commit", return_value="d" * 40),
+                patch("scripts.run_backfill.GitHubReleaseBackend"),
                 patch("scripts.run_backfill.Pipeline.publish", return_value=[object()] * 6),
             ):
                 result = run_partition(
