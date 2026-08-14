@@ -23,6 +23,11 @@ ASSET_STREAMS = {
     Asset.BNB: "https://data.chain.link/streams/bnb-usd",
     Asset.HYPE: "https://data.chain.link/streams/hype-usd",
 }
+ASSET_RULE_NAMES = {
+    Asset.DOGE: ("doge", "dogecoin"),
+    Asset.BNB: ("bnb", "binance coin"),
+    Asset.HYPE: ("hype", "hyperliquid"),
+}
 
 FetchPayload = Callable[[str, int], bytes]
 
@@ -88,7 +93,15 @@ def _rules_bind_stream(asset: Asset, rules: str, source_url: object) -> str:
         "chainlink" in rules_lower and f"{asset.value.lower()}/usd" in rules_lower
     )
     rules_url_stream = expected in rules or f"{expected}/" in rules
-    if declared == expected and (rules_url_stream or rules_name_stream):
+    rules_asset_identity = any(
+        re.search(rf"(?<![a-z0-9]){re.escape(name)}(?![a-z0-9])", rules_lower)
+        for name in ASSET_RULE_NAMES[asset]
+    )
+    # Gamma's dedicated resolutionSource field is authoritative when it is the exact
+    # frozen stream and the controlling prose independently names the bound asset.
+    if declared == expected and (
+        rules_url_stream or rules_name_stream or rules_asset_identity
+    ):
         return expected
     # The per-market rules are controlling when Gamma leaves its redundant summary field blank.
     if not declared and rules_url_stream:

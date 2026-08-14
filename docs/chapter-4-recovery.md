@@ -24,3 +24,9 @@ The bounded `recovery-canary` workflow mode contains exactly the six failed UTC 
 unfinished assets from remote durable evidence, preserves already complete July 29 DOGE/BNB
 partitions, and certifies only after all 375 planned partitions are durable with no publication
 anomalies. Draft dataset Releases remain staged for Chapter 5 final assembly and publication.
+
+The August 7 recovery also recognizes Gamma's dedicated `resolutionSource` field as
+the frozen stream authority when it is exactly the configured per-asset Chainlink URL
+and the controlling rules independently name that asset and retain the Up/Down
+comparison semantics. A blank or different source, a cross-asset rule, or missing
+comparison semantics remains an identity failure.

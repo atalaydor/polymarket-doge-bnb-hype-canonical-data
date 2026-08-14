@@ -73,6 +73,25 @@ class DiscoveryTests(unittest.TestCase):
         found = discover([json.dumps(raw).encode()])
         self.assertEqual(found[0].official_outcome.value, "UP")
 
+    def test_exact_resolution_source_and_asset_named_rules_bind_stream(self) -> None:
+        raw = json.loads(gamma_payload())
+        raw[0]["markets"][0]["description"] = (
+            "This market resolves Up if the Dogecoin price is greater than or equal "
+            "to its start value; otherwise Down."
+        )
+        found = discover([json.dumps(raw).encode()])
+        self.assertEqual(
+            found[0].resolution_source_url,
+            "https://data.chain.link/streams/doge-usd",
+        )
+
+        raw[0]["markets"][0]["description"] = (
+            "This market resolves Up if the Bitcoin price is greater than or equal "
+            "to its start value; otherwise Down."
+        )
+        with self.assertRaises(IdentityError):
+            discover([json.dumps(raw).encode()])
+
     def test_rejects_unresolved_and_ambiguous_outcome(self) -> None:
         raw = json.loads(gamma_payload(outcome_prices=["0.7", "0.3"]))
         with self.assertRaises(IdentityError):
