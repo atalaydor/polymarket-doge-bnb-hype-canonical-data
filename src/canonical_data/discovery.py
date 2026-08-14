@@ -106,7 +106,13 @@ def _rules_bind_stream(asset: Asset, rules: str, source_url: object) -> str:
     # The per-market rules are controlling when Gamma leaves its redundant summary field blank.
     if not declared and rules_url_stream:
         return expected
-    raise IdentityError("rules do not bind the frozen Chainlink stream")
+    rules_digest = hashlib.sha256(rules.encode()).hexdigest()
+    excerpt = " ".join(rules.split())[:500]
+    raise IdentityError(
+        "rules do not bind the frozen Chainlink stream: "
+        f"asset={asset.value} resolutionSource={declared!r} "
+        f"rules_sha256={rules_digest} rules_excerpt={excerpt!r}"
+    )
 
 
 def bind_gamma_market(event: dict[str, Any], retrieved_payload: bytes) -> Market:
